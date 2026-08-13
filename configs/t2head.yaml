@@ -1,0 +1,152 @@
+name: "new_test"
+tag: "${rmspace:${system.prompt_processor.prompt},_}"
+exp_root_dir: "./outputs"
+seed: 0
+
+#data_type: "random-camera-w-cond-datamodule"
+data_type: "random-camera-exp-datamodule"
+data:
+  batch_size: 2
+  eval_camera_distance: 2.0
+  camera_distance_range: [ 1.5, 2.0 ]
+  light_sample_strategy: "dreamfusion3dgs"
+  height: 1024
+  width: 1024
+  eval_height: 1024
+  eval_width: 1024
+  elevation_range: [ -30, 30 ]
+  is_lmk: True
+  is_mediapipe: True
+
+  enable_near_head_poses: true
+  head_offset: -0.05
+  head_camera_distance_range: [ 0.78, 0.92 ]
+  head_fovy_range: [ 52, 56 ]
+  head_elevation_range: [ -6, 6 ]
+  head_prob: 0.2
+  head_start_step: 1200
+  head_end_step: 3600
+  head_azimuth_range: [ 80, 100 ]
+
+  enable_near_back_poses: false
+  back_offset: 0.35
+  back_camera_distance_range: [ 0.8, 1.05 ]
+  back_fovy_range: [ 50, 70 ]
+  back_elevation_range: [ -20, 20 ]
+  back_prob: 0.1
+  back_start_step: 1200
+  back_end_step: 3600
+  back_azimuth_range: [ -180, 0 ]
+
+  training_w_animation: True
+  talkshow_train_path: './talkshow/collection/chemistry_exp.npy'
+  train_path: './assets'
+  open_mouth_exp_path: './assets/open_mouth_exp.npy'
+  open_mouth_pose_path: './assets/open_mouth_pose.npy'
+  open_mouth_prob: 0.3
+  open_mouth_lower_face_prob: 0.8
+  eval_pose_mode: 'open_mouth'
+  eval_open_mouth_index: -1
+  talkshow_val_path: './talkshow/ExpressiveWholeBodyDatasetReleaseV1.0/chemistry/2nd_Order_Rate_Laws-6BZb96mqmbg.mp4/68891-00_01_40-00_01_46/68891-00_01_40-00_01_46.pkl'
+  # Post-training animation in the original training-camera coordinates.
+  test_expression_path: './assets/test/exp.npy'
+  test_pose_path: './assets/test/pose.npy'
+  test_azimuth_deg: 90.0
+  test_elevation_deg: 0.0
+
+system_type: "head-3dgs-lks-rig-system"
+system:
+  radius: ${data.eval_camera_distance}
+  texture_structure_joint: true
+  disable_hand_densification: false
+  pts_num: 100000
+  initialize_teeth: false
+  densify_prune_start_step: 300 # 300
+  densify_prune_end_step: 2100 # 2100
+  densify_prune_interval: 300 # 300
+  shape_update_end_step: 6000
+  size_threshold: 60 # 60
+  max_grad: 0.001 # 0.0002
+  prune_only_start_step: 2400 # 2400
+  prune_only_end_step: 5000 # 3300
+  prune_only_interval: 300 # 300
+  prune_size_threshold: 0.002
+  half_scheduler_max_step: 3000
+  late_guidance_max_step_percent: 0.60
+  size_threshold_fix_step: 1500
+  apose: true
+  bg_white: True
+  lower_face_prompt_prefix: "a realistic front-facing DSLR close-up crop from nose to chin, including the nose, lips, mouth, realistic teeth, chin and jaw, detailed facial skin, "
+  lower_face_negative_prompt: "top of head, scalp-only crop, hair-only crop, forehead-only crop, side view, profile view, back view, full body, full figure"
+  open_mouth_prompt_prefix: "wide open mouth expression, separated upper and lower lips, visible upper and lower teeth, dark oral cavity, open jaw, clear mouth interior, "
+  open_mouth_negative_prompt: "closed mouth, sealed lips, pursed lips, skin-colored mouth interior, chin filling the mouth, lower face surface covering the mouth, fake painted mouth"
+  training_w_animation: ${data.training_w_animation}
+
+  guidance_type: "controlnet-depth-guidance"
+  guidance:
+    pretrained_model_name_or_path: "../HeadStudio_lib/realistic-vision-51"  # "stablediffusionapi/realistic-vision-51"
+    control_type: "mediapipe" # depth
+    min_step_percent: 0.02
+    max_step_percent: 0.60
+    use_nfsd: False
+    use_dsd: False
+    use_ism: False
+    use_vsd: true
+    vsd_start_step: 900
+    vsd_warmup_sds_steps: 900
+    vsd_lambda: 0.5
+    vsd_lambda_ramp_steps: 900
+    vsd_lora_train_start_step: 0
+    vsd_lora_rank: 4
+    vsd_lora_alpha: 4.0
+    vsd_lora_dropout: 0.0
+    vsd_lora_lr: 0.0001
+    vsd_lora_weight_decay: 0.0
+    vsd_lora_steps_per_iter: 1
+    vsd_lora_grad_clip: 1.0
+    vsd_lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+    vsd_lora_use_cfg: false
+    vsd_student_use_cfg: false
+    vsd_student_guidance_scale: 1.0
+    vsd_debug: true
+    vsd_debug_interval: 200
+
+  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor:
+    pretrained_model_name_or_path: '../HeadStudio_lib/realistic-vision-51'      # "stablediffusionapi/realistic-vision-51"
+    prompt: "a DSLR portrait of a handsome young brown lightly wavy Pompadour with fade, muscled sportsman in navy satin large pinstripe double-breasted suit, pompadour haircut"
+    # prompt: "headshot portrait of a 15 y.o modern teenage boy, short messy black hair, dark eyes, casual hairstyle, urban lighting, realistic photo, 8k, HD, masterpiece"
+    negative_prompt: "worst quality, low quality, lowres, blurry, out of focus, jpeg artifacts, noise, grain, watermark, text, logo, signature, cropped, out of frame, duplicate, deformed, disfigured, bad anatomy, bad proportions, asymmetry, extra face, extra eyes, extra mouth, deformed iris, deformed pupils, cross-eyed, dead eyes, glasses, eyeglasses, strong shadow, harsh shadow, underexposed, dark face, overexposed, blown highlights, high contrast, HDR, neon, glow, bloom, lens flare, light streaks, god rays, volumetric lighting, chromatic aberration, color fringing, oversaturated, weird colors, over-sharpened, halos, ringing, banding, cgi, 3d render, cartoon, anime, sketch"
+
+  loggers:
+    wandb:
+      enable: false
+      project: 'threestudio'
+      name: None
+
+  loss:
+    lambda_sds: 1.
+    lambda_vsd: 1.0
+    lambda_sparsity: 0.1
+    lambda_opaque: 1.0
+    lambda_scaling: 0.02
+    lambda_shape: 0.002
+  optimizer:
+    name: Adam
+    args:
+      lr: 0.001
+      betas: [ 0.9, 0.99 ]
+      eps: 1.e-15
+
+trainer:
+  max_steps: 8000 # 10000
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 100
+  enable_progress_bar: true
+  precision: 16-mixed
+
+checkpoint:
+  save_last: true # save at each validation time
+  save_top_k: -1
+  every_n_train_steps: ${trainer.max_steps}

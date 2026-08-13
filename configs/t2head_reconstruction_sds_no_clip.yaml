@@ -1,0 +1,141 @@
+name: "t2head_reconstruction_sds_no_clip"
+tag: "00000001"
+exp_root_dir: "./outputs"
+seed: 0
+
+# SDS clipping ablation.  Apart from the output names, the only differences
+# from t2head_reconstruction_sds.yaml are max_grad_norm=0 and grad_clip=null.
+data_type: "reconstruction-finetune-datamodule"
+data:
+  reconstruction_dir: "./outputs/reconstruction/00000001"
+  chemistry_path: "./talkshow/collection/chemistry_exp.npy"
+  height: 512
+  width: 512
+  batch_size: 2
+  eval_height: 512
+  eval_width: 512
+  eval_batch_size: 1
+  n_val_views: 8
+  num_workers: 0
+  # Post-training animation: exact Stage-1 calibrated frontal camera.
+  test_expression_path: "./assets/test/exp.npy"
+  test_pose_path: "./assets/test/pose.npy"
+  test_camera_frame_index: 21
+  validation_expression_path: "./assets/open_mouth_exp.npy"
+  validation_pose_path: "./assets/open_mouth_pose.npy"
+  eval_open_mouth_index: -1
+  use_dynamic_expression: true
+  reference_pose_probability: 0.0
+  eval_pose_mode: "open_mouth"
+  eval_chemistry_index: 0
+  chemistry_jaw_outlier_quantile: 0.999
+  chemistry_jaw_max_norm: 0.0
+  chemistry_expression_max_norm: 30.0
+  chemistry_eye_max_norm: 1.0
+  chemistry_open_mouth_quantile: 0.80
+  chemistry_open_mouth_oversample: true
+  chemistry_open_mouth_prob: 0.50
+  use_mediapipe_condition: true
+  condition_device: "cuda"
+  projection_min_depth: 1.0e-5
+
+system_type: "head-3dgs-reconstruction-finetune-system"
+system:
+  initialization_dir: ${data.reconstruction_dir}
+  prompt: "a DSLR portrait of a handsome young brown lightly wavy Pompadour with fade, muscled sportsman in navy satin large pinstripe double-breasted suit, pompadour haircut"
+
+  diffusion_weight: 0.2
+  diffusion_background_weight: 0.02
+  guidance_warmup_steps: 300
+  reference_resolution: 128
+  reference_kernel: 7
+  reference_alpha_weight: 0.25
+  reference_weight: 1.0
+  reference_tolerance: 0.002
+  reference_dual_lr: 10.0
+  reference_max_weight: 10.0
+  chroma_weight: 0.005
+  chroma_threshold: 0.85
+  max_world_scale: 0.16
+  world_scale_weight: 0.01
+
+  optimization:
+    max_steps: 4000
+    geometry_start: 600
+    final_lr_ratio: 0.2
+    feature_lr: 1.0e-3
+    opacity_lr: 2.5e-4
+    d_lr: 4.0e-6
+    scale_lr: 5.0e-5
+    rotation_lr: 1.0e-5
+    # <= 0 skips global-norm clipping in Head3DGSLKsFinetune.py.
+    max_grad_norm: 0.0
+
+  proximal:
+    feature: 0.05
+    opacity: 0.05
+    d: 1.0
+    scale: 0.10
+    rotation: 0.05
+
+  mouth:
+    points: 1000
+    rgb: [0.025, 0.012, 0.012]
+    opacity: 0.35
+    initial_scale_min: 5.0e-4
+    initial_scale_max: 1.0e-2
+    max_scale: 0.015
+    max_abs_d: 0.002
+    barrier_weight: 0.02
+
+  export_name: "stage2_sds_no_clip"
+
+  guidance_type: "controlnet-depth-guidance"
+  guidance:
+    pretrained_model_name_or_path: "../HeadStudio_lib/realistic-vision-51"
+    control_type: "mediapipe"
+    guidance_scale: 5.0
+    condition_scale: 1.0
+    cfg_unconditional_source: "negative"
+    vae_encode_mode: true
+    min_step_percent: 0.02
+    max_step_percent: [0, 0.50, 0.30, 4000]
+    # null disables element-wise clipping of the latent SDS gradient.
+    grad_clip: null
+    half_precision_weights: true
+    coupled_batch: true
+    coupled_share_t: true
+    coupled_share_noise: false
+    coupled_mean_grad: false
+    coupled_apply_to_sds: true
+    use_nfsd: false
+    use_dsd: false
+    use_ism: false
+    use_vsd: false
+
+  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor:
+    pretrained_model_name_or_path: "../HeadStudio_lib/realistic-vision-51"
+    prompt: ${system.prompt}
+    negative_prompt: "worst quality, low quality, blurry, jpeg artifacts, watermark, text, duplicate face, extra eyes, extra mouth, deformed eyes, asymmetry, overexposed, blown highlights, high contrast, HDR, neon, glow, bloom, chromatic aberration, oversaturated, unnatural skin color, waxy skin, cgi, cartoon, painted mouth, fused lips, duplicated teeth, floating teeth, malformed teeth, skin-colored mouth interior"
+    use_cache: true
+    spawn: true
+
+  loggers:
+    wandb:
+      enable: false
+      project: "t2head-stage2"
+      name: null
+
+trainer:
+  max_steps: 4000
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 500
+  enable_progress_bar: true
+  precision: "16-mixed"
+
+checkpoint:
+  save_last: true
+  save_top_k: -1
+  every_n_train_steps: 500

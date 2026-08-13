@@ -1,0 +1,309 @@
+# Archived direct-target Stage-2 configuration kept for reproducibility.
+#
+# Workflow:
+#   1. deterministically remove the broken Stage-1 oral-cavity Gaussians,
+#      reseed a compact cavity surface, and reset the existing teeth;
+#   2. use masked SDXL only for missing oral anatomy;
+#   3. pass every complete portrait through low-strength RV5.1 + MediaPipe
+#      ControlNet so face, ears, hair, neck, and clothing are all enhanced;
+#   4. keep the more natural RV mouth whenever it passes anatomy checks; only
+#      use a small inward-feathered SDXL fallback if RV erases oral structure;
+#   5. directly inverse-render the shared UVD Gaussians against those targets.
+#
+# The Gaussian UV binding remains immutable. Geometry is editable only in
+# explicitly listed regions. Appearance and opacity can follow the complete
+# foreground teacher while oral geometry remains the only learned geometry.
+
+seed: 0
+device: cuda
+
+input:
+  reconstruction_dir: outputs/reconstruction/00000001
+
+output:
+  root: outputs/inpaint
+  # Keep older mouth-only/local-repair runs intact for comparison.
+  name: "00000001_global_rv_natural_teeth"
+  # null resolves to <output.root>/<output.name>/targets.
+  target_cache: null
+  log_interval: 10
+  preview_interval: 250
+
+data:
+  chemistry_path: talkshow/collection/chemistry_exp.npy
+  # Keep the exact Stage-1 camera resolution. Teacher/training raster
+  # resolution is scaled separately below without changing the field of view.
+  height: 512
+  width: 512
+  batch_size: 1
+  eval_height: 512
+  eval_width: 512
+  eval_batch_size: 1
+  n_val_views: 60
+  num_workers: 0
+
+  test_expression_path: assets/test/exp.npy
+  test_pose_path: assets/test/pose.npy
+  test_camera_frame_index: 21
+  validation_expression_path: assets/open_mouth_exp.npy
+  validation_pose_path: assets/open_mouth_pose.npy
+  eval_open_mouth_index: -1
+  eval_pose_mode: reference
+  eval_chemistry_index: 0
+
+  use_dynamic_expression: true
+  reference_pose_probability: 0.25
+  chemistry_jaw_outlier_quantile: 0.995
+  chemistry_jaw_max_norm: 1.25
+  chemistry_expression_max_norm: 7.0
+  chemistry_eye_max_norm: 0.8
+  chemistry_open_mouth_quantile: 0.80
+  chemistry_open_mouth_oversample: true
+  chemistry_open_mouth_prob: 0.35
+
+  # The RV5.1 refinement uses the calibrated FLAME/MediaPipe condition.
+  use_mediapipe_condition: true
+  condition_device: cuda
+  projection_min_depth: 0.0001
+
+# After the 3,000-step fit, render the paired assets/test exp.npy + pose.npy
+# sequence with the trained avatar and calibrated camera frame 21.
+test_render:
+  enabled: true
+  height: 512
+  width: 512
+  fps: 30
+  save_masks: true
+  contact_sheet_frames: 12
+
+bootstrap:
+  enabled: true
+  seed: 0
+  # Stage-1 also contains highly anisotropic scalp/neck Gaussians. Preserve
+  # centers, colors and opacity, but rebuild strict outlier covariances as
+  # compact isotropic world-space kernels.
+  isotropize_streaks: true
+  absolute_scale_threshold: 0.100
+  streak_scale_threshold: 0.020
+  streak_aspect_threshold: 100.0
+  streak_max_world_scale: 0.006
+  # Stage-1 cavity points contain the long black streaks. Remove them before
+  # optimizer creation, then add a compact FLAME-bound cavity layer.
+  remove_existing_cavity: true
+  cavity_points: 1200
+  cavity_rgb: [0.025, 0.012, 0.012]
+  cavity_opacity: 0.35
+  cavity_scale_min: 0.0005
+  # Keep the rigid back-wall kernels compact under all expressions.
+  cavity_scale_max: 0.004
+  # Keep the Stage-1 teeth topology/UV, but reset unstable displacement,
+  # appearance, opacity, and extreme scale.
+  reset_teeth: true
+  teeth_rgb: [0.78, 0.76, 0.72]
+  teeth_opacity: 0.55
+  max_initial_world_scale: 0.010
+
+teacher:
+  model_path: ../HeadStudio_lib/stable-diffusion-xl-1.0-inpainting-0.1
+  variant: fp16
+  local_files_only: true
+  attention_slicing: false
+  # image_size controls the SDXL inference raster; render_height/render_width
+  # independently control inverse rendering and RV. All keep full-frame
+  # context and do not change camera field of view.
+  full_frame: true
+  # The one-time teacher render/diffusion pass runs at the old high-quality
+  # 1024 setting. Accepted targets are downsampled to 512 before caching, and
+  # all 3,000 Stage-2 optimization iterations therefore remain at 512.
+  image_size: 1024
+  render_height: 1024
+  render_width: 1024
+  target_height: 512
+  target_width: 512
+  # Morphology radii below are specified at this reference resolution and are
+  # scaled automatically when render_height/render_width are changed to 512.
+  mask_reference_resolution: 1024
+
+  # Near-horizontal calibrated cameras. 270 degrees is the primary front
+  # view for the current camera convention.
+  source_elevation: 0.0
+  source_azimuths: [240, 270, 300]
+
+  # Reference is useful as an identity anchor but is not diffused by default.
+  include_reference_pose: true
+  inpaint_reference_pose: false
+  # Add wide and near-maximum chemistry poses; validation supplies the
+  # deterministic widest-open expression.
+  pose_quantiles: [0.80, 0.95]
+  include_validation_pose: true
+
+  # Restore the old natural-tooth seed bank. One difficult q95 oblique view
+  # uses its previously inspected override; all other views share seed 0.
+  mouth_candidates_per_view: 1
+  # Additional complete target samples are only for uncertainty estimation.
+  seed: 0
+  # The shared 2D seed is only a deterministic teacher prior; actual 3D
+  # consistency comes from fitting the same canonical UVD Gaussians.
+  seed_mode: shared
+  # Explicit overrides are reserved for manually inspected diffusion failures;
+  # keys use "<pose_label>_frame_<camera frame>".
+  seed_overrides:
+    jaw_q95_frame_020: 14
+  # Optional exact pose/view mouth teachers. Keep this empty in the portable
+  # default configuration: historical outputs are not project dependencies
+  # and may not exist on another machine. A configured target must have a
+  # sibling *_source.png and uses a key such as jaw_q95_frame_021.
+  accepted_mouth_priors: {}
+  # When optional priors are configured, abort rather than applying one whose
+  # source render does not match the current Stage-1 pose/view.
+  accepted_mouth_prior_max_source_mae: 0.01
+  samples_per_view: 1
+  confidence_tau: 0.002
+  confidence_min: 0.15
+
+  # These crop settings are used only when full_frame=false.
+  crop_scale: 2.30
+  crop_min_size: 192
+  # Match the old get_mouth_mask(): outer-lip convex hull with a 15x15
+  # dilation kernel. Feathering is applied only when compositing the result
+  # and when training; SDXL still receives the exact hard mask.
+  mask_dilation: 7
+  mask_feather: 10
+  aperture_dilation: 0
+
+  num_inference_steps: 45
+  strength: 0.70
+  guidance_scale: 6.5
+  append_view_prompt: false
+  open_mouth_prompt: >-
+    a realistic human mouth, open lips, upper and lower teeth aligned,
+    visible incisors, natural oral cavity, detailed lips texture,
+    correct anatomy
+  negative_prompt: >-
+    closed mouth, blurry, distorted mouth, extra teeth, missing teeth,
+    bad anatomy, fog, smoke, low detail
+
+  # The old working teacher used this SD1.5/RV5.1 pass after SDXL as an
+  # image-wide portrait enhancer. RV sees the complete image and its output is
+  # used over the complete rendered foreground, including face and ears.
+  rv51:
+    enabled: true
+    model_path: ../HeadStudio_lib/realistic-vision-51
+    controlnet_path: ../HeadStudio_lib/ControlNetMediaPipeFace
+    controlnet_subfolder: diffusion_sd15
+    controlnet_use_safetensors: false
+    scheduler_path: ../HeadStudio_lib/realistic-vision-51
+    local_files_only: true
+    half_precision: true
+    attention_slicing: false
+    # RV synthesizes at 1024, then downsamples into the 512 training target.
+    # This recovers the natural detail of the old teacher without doubling
+    # Gaussian rendering and Stage-2 optimization cost.
+    image_size: 1024
+    seed_offset: 0
+    composite_scope: foreground
+    refine_reference_pose: true
+    # Raw RV is always preferred. If it fails oral anatomy checks, try only
+    # these small SDXL contributions, feathered strictly inside the aperture.
+    # The zero first entry is required and prevents a pasted-mouth seam.
+    mouth_fallback_alphas: [0.0, 0.15, 0.30]
+    mouth_fallback_feather: 8
+    foreground_alpha_threshold: 0.01
+    foreground_dilation: 8
+    foreground_feather: 8
+    # Match the old working teacher's low img2img strength.
+    strength: 0.20
+    num_inference_steps: 50
+    guidance_scale: 7.5
+    controlnet_conditioning_scale: 1.5
+    # FLAME/MediaPipe ControlNet already carries the calibrated view. Textual
+    # view labels biased side-view tooth placement and are therefore omitted.
+    append_view_prompt: false
+    prompt: >-
+      a DSLR portrait of a handsome young brown lightly wavy Pompadour with
+      fade, muscled sportsman in a navy satin large pinstripe double-breasted
+      suit, natural open mouth with visible aligned teeth
+    negative_prompt: >-
+      worst quality, low quality, lowres, blurry, out of focus, jpeg artifacts,
+      noise, grain, watermark, text, logo, duplicate, deformed, disfigured,
+      bad anatomy, asymmetry, extra face, extra eyes, extra mouth, harsh shadow,
+      underexposed, overexposed, high contrast, HDR, neon, glow, bloom,
+      chromatic aberration, oversaturated, weird colors, cgi, 3d render,
+      cartoon, anime, sketch
+
+  # Target-bank gates. These are part of the cache signature: tightening them
+  # invalidates an older bank instead of silently reusing unverified targets.
+  quality:
+    # The two-stage entry point overrides this to false: metrics are retained
+    # in its manifest, but stochastic targets are never rejected.
+    enforce: true
+    max_outside_edit_delta: 0.0
+    # This is a wiring check, not an image-quality score: a global RV pass must
+    # actually change non-mouth foreground pixels and cover the rendered ears.
+    min_non_mouth_delta: 0.001
+    min_ear_edit_coverage: 0.95
+    min_ear_delta: 0.001
+    max_edit_mask_fraction: 0.90
+    teeth_hint_threshold: 0.10
+    teeth_min_luminance: 0.48
+    teeth_max_saturation: 0.42
+    teeth_max_chroma: 0.20
+    # dental_coverage is used only as a weak front-view visibility check.
+    # Denture rejection uses normalized connected-component structure instead.
+    min_teeth_coverage: 0.10
+    min_teeth_component_coverage: 0.005
+    max_teeth_component_coverage: 0.12
+    max_teeth_component_span: 0.78
+    min_teeth_component_aspect: 1.5
+    min_teeth_span_front: 0.15
+    min_teeth_span_three_quarter: 0.0
+    min_mouth_dark_fraction: 0.28
+    # Multiple SDXL candidates are ranked around this natural center rather
+    # than by maximum white-tooth area.
+    preferred_teeth_component_coverage: 0.035
+    preferred_teeth_span: 0.48
+    preferred_mouth_dark_fraction: 0.40
+
+optimization:
+  # The teacher supervises the complete foreground, so all Gaussian colors and
+  # opacity must be trainable. Learned geometry stays mouth-only.
+  appearance_regions: [all]
+  opacity_regions: [all]
+  geometry_regions:
+    [teeth_upper, teeth_lower, oral_cavity]
+  # Geometry first, then appearance-only consolidation.
+  geometry_iterations: 1000
+  appearance_iterations: 2000
+  batch_size: 1
+  feature_lr: 0.001
+  opacity_lr: 0.00025
+  d_lr: 0.000004
+  scale_lr: 0.00005
+  rotation_lr: 0.00001
+  betas: [0.9, 0.99]
+  eps: 1.0e-15
+  max_grad_norm: 1.0
+  max_abs_d: 0.004
+  max_world_scale: 0.015
+
+loss:
+  photo_weight: 10.0
+  ssim_weight: 2.0
+  perceptual_weight: 0.01
+
+  # Strongly preserve everything outside the target edit mask.
+  identity_weight: 10.0
+
+  # Keep editable geometry local and smooth in canonical UV. The feature
+  # anchor prevents the low-strength global teacher from changing identity.
+  d_proximal_weight: 0.05
+  scale_proximal_weight: 0.02
+  feature_proximal_weight: 0.02
+  opacity_proximal_weight: 0.02
+  rotation_proximal_weight: 0.01
+  uv_laplacian_weight: 0.20
+  uv_neighbors: 6
+  scale_barrier_weight: 100.0
+
+checkpoint:
+  interval: 250

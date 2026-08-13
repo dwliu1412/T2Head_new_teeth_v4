@@ -1,0 +1,331 @@
+name: "reconstruction_mouth"
+tag: "run"
+use_timestamp: false
+exp_root_dir: "./outputs"
+seed: 42
+
+# AnimPortrait3D train_mouth.py counterpart for a Stage-1 UVD reconstruction.
+# It samples the exact paired AnimPortrait3D open-mouth sequence and calibrated
+# near-frontal views.
+data_type: "reconstruction-finetune-datamodule"
+data:
+  reconstruction_dir: "./outputs/reconstruction/00000001"
+  chemistry_path: "./talkshow/collection/chemistry_exp.npy"
+  height: 512
+  width: 512
+  # GSAvatar accumulates three independently sampled pose/view gradients for
+  # each ISM optimizer step. The system handles that phase-dependent schedule
+  # manually; SDEdit remains one sample per optimizer step.
+  batch_size: 1
+  surface_consistent_batch: false
+  eval_height: 512
+  eval_width: 512
+  eval_batch_size: 1
+  n_val_views: 8
+  num_workers: 0
+  test_expression_path: "./assets/test/exp.npy"
+  test_pose_path: "./assets/test/pose.npy"
+  test_camera_frame_index: 42
+  validation_expression_path: "./assets/open_mouth_exp.npy"
+  validation_pose_path: "./assets/open_mouth_pose.npy"
+  eval_open_mouth_index: -1
+
+  train_pose_mode: "animportrait3d_mouth"
+  # Prompt-space front is approximately 90 degrees.  This is the calibrated
+  # equivalent of train_mouth.py's yaw=40..140 and pitch=70..110 sampling;
+  # pitch=70..110 maps to elevation=+20..-20, not +35 degrees.
+  train_azimuth_range: [40.0, 140.0]
+  train_elevation_range: [-20.0, 20.0]
+  use_dynamic_expression: true
+  reference_pose_probability: 0.0
+  eval_pose_mode: "open_mouth"
+  chemistry_jaw_outlier_quantile: 0.999
+  chemistry_jaw_max_norm: 0.0
+  chemistry_expression_max_norm: 30.0
+  chemistry_eye_max_norm: 1.0
+  chemistry_open_mouth_quantile: 0.80
+  chemistry_open_mouth_oversample: true
+  chemistry_open_mouth_prob: 1.0
+  # AnimPortrait3D train_mouth.py uses a 4-channel condition composed of
+  # face-region camera normals (RGB) and FLAME semantic segmentation (1ch).
+  condition_type: "animportrait3d_normal_seg"
+  use_condition: true
+  condition_device: "cuda"
+  projection_min_depth: 1.0e-5
+  animportrait3d_assets_dir: "./ckpts/animportrait3d_normal_seg_flame_teeth"
+
+system_type: "head-3dgs-reconstruction-finetune-system"
+system:
+  initialization_dir: ${data.reconstruction_dir}
+  initialization_ply: ""
+  initialization_params: ""
+  optimization_stage: "mouth"
+  # train_mouth.py always optimizes "mouth region, " + abstract_prompt.
+  prompt: "mouth region, a photorealistic human portrait with natural, well-defined teeth and lips"
+
+  diffusion_weight: 1.0
+  diffusion_background_weight: 0.0
+  guidance_warmup_steps: 0
+  reference_resolution: 128
+  reference_kernel: 7
+  reference_alpha_weight: 0.25
+  # GSAvatar's mouth pass has no closed-mouth identity replay.  Keeping it
+  # here suppressed the newly bootstrapped teeth and drove them back toward
+  # the dark/low-opacity Stage-1 result.
+  reference_weight: 0.0
+  reference_tolerance: 0.004
+  reference_dual_lr: 0.0
+  reference_max_weight: 0.0
+  chroma_weight: 0.0
+  chroma_threshold: 0.85
+  max_world_scale: 0.10
+  world_scale_weight: 10.0
+
+  optimization:
+    # 500 ISM steps followed by 500 SDEdit reconstruction steps.
+    max_steps: 1000
+    # Reference train_mouth.py uses 3 pose/view samples per ISM optimizer step
+    # but exactly 1 sample per SDEdit step.
+    ism_accumulate_grad_batches: 3
+    geometry_start: 0
+    # GSAvatar values are feature=.00375, opacity=.075, scale=.0255 and
+    # rotation=.0015.  UVD position uses its effective XYZ learning rate and
+    # remains guarded by face projection plus the posed-world hard cap.
+    final_lr_ratio: 1.0
+    feature_lr: 3.75e-3
+    opacity_lr: 7.5e-2
+    uv_lr: 2.985e-5
+    d_lr: 2.985e-5
+    scale_lr: 2.55e-2
+    rotation_lr: 1.5e-3
+    max_grad_norm: 0.0
+
+  proximal:
+    uv: 0.0
+    feature: 0.0
+    opacity: 0.0
+    d: 0.0
+    scale: 0.0
+    rotation: 0.0
+
+  # Stage 1 already contains explicit teeth and oral-cavity support.  Set
+  # points > 0 only when refining a legacy reconstruction without enough
+  # cavity coverage.
+  mouth:
+    points: 0
+    rgb: [0.025, 0.012, 0.012]
+    opacity: 0.35
+    initial_scale_min: 5.0e-4
+    initial_scale_max: 1.0e-2
+    # Stage 1 has only 20k dental/oral points while GSAvatar begins near 152k
+    # and densifies once. Pre-seeding crowns is the fixed-topology equivalent.
+    # Stage 1 has about 20k dental rows; seed to the ~302,641 rows present
+    # after GSAvatar's mouth densification instead of stopping at only 120k.
+    teeth_points: 282641
+    teeth_rgb: [0.72, 0.70, 0.66]
+    teeth_opacity: 0.55
+    teeth_scale_min: 2.5e-4
+    teeth_scale_max: 3.0e-3
+    bootstrap:
+      enabled: true
+      rgb: [0.72, 0.70, 0.66]
+      opacity: 0.55
+      reset_d: true
+    max_scale: 0.010
+    max_abs_d: 0.002
+    barrier_weight: 100.0
+
+  # Stage-1 UVD covariance outliers can become 0.07-0.67 world-unit streaks
+  # under a large jaw pose. Repair them before optimization, then hard-cap
+  # dental splats throughout training.
+  geometry_stability:
+    enabled: true
+    expression_path: "./assets/open_mouth_exp.npy"
+    pose_path: "./assets/open_mouth_pose.npy"
+    jaw_quantiles: [0.5, 0.9, 1.0]
+    global:
+      enabled: true
+      passes: 4
+      absolute_max_scale: 0.10
+      absolute_cap: 0.006
+      # At the maximum open-jaw pose only 15/137k legacy rows exceed this
+      # conservative in-plane ratio, and they are precisely the visible
+      # needle-like splats. Healthy disk-like surface Gaussians are measured
+      # with s0/s1 (not s0/s2) and therefore remain untouched.
+      min_streak_scale: 0.010
+      max_planar_aspect: 20.0
+      repair_margin: 1.0
+      min_canonical_scale: 1.0e-8
+    dental_max_world_scale: 0.010
+    dental_passes: 3
+    project_interval: 1
+    envelope_project_interval: 100
+
+  # Only teeth receive optimizer gradients, exactly as in train_mouth.py.
+  # Lips and oral cavity remain visible in both the crop and ControlNet input.
+  mouth_trainable_regions: ["teeth"]
+  mouth_guidance_regions: ["lips", "teeth", "oral_cavity"]
+  mouth_guidance_dilation: 24
+  guidance_crop_main: true
+  guidance_crop_padding: 16
+  guidance_crop_square: true
+  guidance_full_crop_loss: true
+  mouth_crop_from_landmarks: true
+  mouth_crop_reference_size: 200
+  mouth_crop_reference_resolution: 896
+  freeze_dental_when_closed: true
+  regional_guidance:
+    enabled: false
+
+  # Canonical correspondence used only by UVD-consistent ISM.  The historical
+  # CLI label is --guidance-mode uvd-sfd; both modes otherwise use the same
+  # AnimPortrait3D inversion target, schedule, weights, and optimizer.
+  uvd_surface_flow:
+    alpha_threshold: 0.05
+    contribution_threshold: 0.01
+    dominance_ratio: 1.10
+    # Reject pixels whose alpha-weighted UVD samples mix a seam or multiple
+    # surfaces (maximum per-channel canonical variance).
+    max_uvd_variance: 0.0025
+    opacity_floor: 0.0
+    d_range: null
+    d_padding_ratio: 0.05
+
+  # Matches train_mouth.py Stage 2: freeze the step-500 first-phase result, generate
+  # 20-step img2img targets at strength 0.35, then optimize L1 + LPIPS only
+  # inside the rendered mouth crop.
+  sdedit:
+    enabled: true
+    # "independent" is the untouched AnimPortrait3D teacher.  The CLI switch
+    # --sdedit-mode flame-surface enables the opt-in joint K/V-memory branch
+    # and raises data.batch_size only for that ablation.
+    mode: "independent"
+    start_step: 500
+    strength: 0.35
+    num_inference_steps: 20
+    guidance_scale: 7.5
+    negative_prompt: "oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull"
+    weight: 1.0
+    l1_weight: 0.8
+    lpips_weight: 0.2
+    lpips_net: "vgg"
+    require_lpips: true
+    crop_main: true
+    crop_regions: true
+    crop_padding: 8
+    square_crop: true
+    full_crop_loss: true
+    native_crop_loss: true
+    main_use_control: true
+    regional_use_control: true
+    # GSAvatar's SDEdit passes mouth_text_prompt directly; only ISM selects
+    # front/side/back embeddings.
+    view_dependent_prompting: false
+    surface_memory:
+      enabled: false
+      views: 4
+      atlas_resolution: 64
+      max_tokens: 65536
+      min_views: 2
+      max_memory_views: 4
+      strength: 0.65
+      start_progress: 0.45
+      end_progress: 1.0
+      exclude_self: false
+      # High-frequency refinement lives in the final two SD1.5 up blocks;
+      # text cross-attention is never wrapped.
+      processor_patterns: ["up_blocks.2", "up_blocks.3"]
+      alpha_threshold: 0.005
+      contribution_threshold: 0.005
+      variance_threshold: 0.0025
+      depth_tolerance: 0.01
+      dominance_ratio: 1.10
+      opacity_floor: 0.03
+      require_runtime_activity: true
+
+  # Capture the exact 500-step ISM/UVD-consistent-ISM result before SDEdit
+  # update. Outputs are mouth_ism.* (or mouth_uvd_sfd.*) plus a complete
+  # *_driving_test frame directory and MP4.
+  first_phase_artifacts:
+    enabled: true
+    save_gaussian: true
+    render_driving_test: true
+    driving_fps: 30
+  export_name: "mouth"
+
+  guidance_type: "controlnet-depth-guidance"
+  guidance:
+    pretrained_model_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    pretrained_vae_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/sd-vae-ft-ema"
+    ddim_scheduler_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    edit_use_pipeline_scheduler: true
+    control_type: "animportrait3d"
+    pretrained_controlnet_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/AnimPortrait3D_controlnet"
+    controlnet_conditioning_channels: 4
+    guidance_scale: 7.5
+    condition_scale: 1.0
+    diffusion_steps: 20
+    cfg_unconditional_source: "negative"
+    vae_encode_mode: false
+    min_step_percent: 0.015
+    max_step_percent: [0, 0.75, 0.015, 499]
+    grad_clip: null
+    half_precision_weights: true
+    coupled_batch: true
+    coupled_share_t: true
+    coupled_share_noise: false
+    coupled_mean_grad: false
+    coupled_apply_to_sds: true
+    use_nfsd: false
+    use_dsd: false
+    use_uvd_surface_flow: false
+    uvd_flow_noise_seed: 0
+    # The surface-flow paper reports 512 as the lowest tested atlas resolution;
+    # 256 caused severe cell reuse in the observed mouth run.
+    uvd_flow_uv_resolution: 512
+    uvd_flow_depth_resolution: 8
+    uvd_flow_surface_layers: 5
+    # Under-resolved tiles blend canonical and independent noise while
+    # preserving unit marginal variance; this never scales the ISM gradient.
+    uvd_flow_min_distinct_cells: 8
+    use_ism: true
+    ism_variant: "animportrait3d"
+    ism_delta_t: 50
+    ism_sample_at_max_step: true
+    use_vsd: false
+
+  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor:
+    pretrained_model_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    prompt: ${system.prompt}
+    # Exact GSAvatar view syntax: "front|side|back view {mouth prompt}" with
+    # front=(60,120), side=(0,60) U (120,195), otherwise back.
+    view_prompt_style: "animportrait3d"
+    negative_prompt: "tattoo, highlight, blur, no-shadow, lowres, bad anatomy, cropped, worst quality"
+    use_cache: true
+    spawn: true
+
+  loggers:
+    wandb:
+      enable: false
+      project: "t2head-mouth-refinement"
+      name: null
+
+trainer:
+  max_steps: 1000
+  # Phase-dependent accumulation is handled by the system.
+  accumulate_grad_batches: 1
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 100
+  enable_progress_bar: true
+  # The reference Gaussian optimizer is FP32. With 419k UVD Gaussians the
+  # mouth ISM reduction overflows fp16 every step: GradScaler reaches zero and
+  # silently skips Adam. Keep diffusion weights internally fp16, but run the
+  # renderer/loss/optimizer path without an fp16 GradScaler.
+  precision: "32-true"
+
+checkpoint:
+  save_last: true
+  save_top_k: -1
+  every_n_train_steps: 100

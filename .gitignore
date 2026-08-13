@@ -1,0 +1,14 @@
+.idea
+.threestudio_cache
+__pycache__/
+*.py[cod]
+ckpts/
+outputs/
+talkshow/
+diff-gaussian-rasterization/
+.codex
+.agent
+.ipynb_checkpoints
+pretrained/
+.pytest_cache
+.ruff_cache

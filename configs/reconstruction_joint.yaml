@@ -1,0 +1,75 @@
+input_dir: outputs/facelift_multiview/00000002
+output_root: outputs/reconstruction_joint
+camera_file: cameras_joint.json
+# null means: read flame_parameter_file from cameras_joint.json.
+flame_parameter_file: null
+alignment_file: flame_alignment_joint/alignment.npz
+device: cuda
+seed: 0
+
+model:
+  sh_degree: 0
+  initial_points: 100000
+  include_teeth: true
+  teeth_points: 8000
+  oral_cavity_points: 12000
+  teeth_color: [0.5529411765, 0.5215686275, 0.4784313725]
+  oral_cavity_color: [0.2509803922, 0.1176470588, 0.1137254902]
+  flame_scale: -10.0
+  spatial_lr_scale: 4.0
+
+# Sampling remains deterministic. Repeats are virtual sampling weights and do
+# not duplicate images or FLAME arrays. With 120 multiview and 72 LivePortrait
+# observations, repeat=1 gives a 62.5% / 37.5% split.
+sampling:
+  source_repeats:
+    multiview: 1
+    liveportrait: 1
+
+training:
+  iterations: 3000
+  background: [1.0, 1.0, 1.0]
+  l1_weight: 0.8
+  dssim_weight: 0.2
+  log_interval: 10
+  output_interval: 500
+  # Static lower/front/upper views plus neutral/open-mouth/smile dynamic frames.
+  preview_view_indices: [18, 42, 66, 120, 138, 165]
+  frozen_regions: [teeth, oral_cavity]
+
+optimization:
+  position_lr_init: 0.00005
+  position_lr_final: 0.000025
+  position_lr_delay_mult: 0.5
+  position_lr_max_steps: 3000
+  feature_lr: 0.0125
+  opacity_lr: 0.01
+  scaling_lr: 0.005
+  rotation_lr: 0.001
+  percent_dense: 0.01
+
+regularization:
+  lambda_scale: 100.0
+  threshold_scale: 0.05
+
+densify:
+  start: 0
+  end: 3000
+  interval: 200
+  grad_threshold: 0.0002
+  min_opacity: 0.0
+  max_screen_size: null
+
+prune_only:
+  enabled: false
+  start: 3000
+  end: 3000
+  interval: 500
+  min_opacity: 0.005
+
+drive:
+  exp_path: assets/test/exp.npy
+  pose_path: assets/test/pose.npy
+  # Static front camera (elev_0_azim_270.png).
+  camera_index: 42
+  fps: 30

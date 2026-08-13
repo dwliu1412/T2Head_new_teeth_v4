@@ -1,0 +1,73 @@
+paths:
+  train_data: "assets"
+  test_data: "assets/test"
+  img_path: "outputs/refinement/00000001/full_loop/stage2"
+  ply_path: "outputs/refinement/00000001/mouth_sfd_inde/save/mouth.ply"
+  config_path: "outputs/refinement/00000001/parsed.yaml"
+  output_root: "outputs/refinement/00000001/full_loop"
+
+train:
+  epochs: 10
+  train_bs: 8
+  test_bs: 1
+  save_every_n_epochs: 1
+  fix_exp_step: 6000
+  freeze_geometry: false  # true freezes uv/d/scale/rotation/FLAME shape and skips densify/prune.
+  geometry_schedule:
+    enabled: true
+    freeze_epochs: 2
+    train_groups: ["uv_logits", "d", "scaling", "rotation"]
+    lr_scale: 0.1
+    keep_shape_frozen: true
+    allow_densify_prune: false
+
+test:
+  azim_min: 60.0
+  azim_max: 120.0
+  elev_deg: 15.0
+  dist: 2.0
+
+#teacher:
+#  use_confidence_refinement: true
+#  n_samples: 1        # K
+#  tau: 0.002          # 越小越“严格”，不稳定区域 conf 更低
+#  conf_min: 0.15
+#  save_conf: true
+
+avatar:
+  densify_prune_start_step: 100 # 300
+  densify_prune_end_step: 500 # 2100
+  densify_prune_interval: 100 # 300
+  prune_only_start_step: 600 # 2400
+  prune_only_end_step: 1500 # 3300
+  prune_only_interval: 100 # 300
+  size_threshold_fix_step: 500
+  prune_size_threshold: 0.002
+  size_threshold: 60
+  max_grad: 0.002 # 0.0002
+
+  render_height: 1024
+  render_width: 1024
+  fovy_deg: 70.0
+
+camera:
+  fixed: true
+  seed: 42
+  azimuth_start_deg: 60.0
+  azimuth_end_deg: 120.0
+  elevation_deg: 15.0
+  distance: 2.0
+  azimuth_fill_count: 180
+
+loss:
+  l1_weight: 1.0
+  ssim_weight: 0.2
+  mse_weight: 1.0
+  vgg_weight: 0.01
+
+  uv_atlas_start_step: 2400
+  uv_vis_k: 12.0      #
+  uv_vis_gamma: 2.0   #
+  uv_vis_jump_thresh: 0.25
+
+device: cuda

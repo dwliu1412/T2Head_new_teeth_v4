@@ -1,0 +1,305 @@
+# Surface-coherent Stage-2 refinement.
+#
+# This is a coarse-to-fine surface pipeline, not a bank of independent pseudo
+# images. Stage 0 repairs covariance streaks over a FLAME-pose envelope.
+# Stage 1 builds an absolute face atlas plus independent signed-residual
+# lip/upper-teeth/lower-teeth/cavity atlases from a multi-elevation calibrated
+# grid. Stage 2 consumes exact same-pose/same-view low-noise teacher RGB
+# directly; its U-Net exchanges features only at matching semantic-layer and
+# canonical-surface coordinates.
+
+seed: 0
+device: cuda
+
+input:
+  # Stage-1 output directory containing:
+  #   model/uvd.ply
+  #   model/reconstruction_params.npz
+  reconstruction_dir: outputs/reconstruction/00000001
+
+# Root/head rigid motion is deliberately excluded. Cameras stay in the exact
+# Stage-1 calibrated coordinate system; only expression, jaw and eyes drive
+# FLAME. These switches are provenance assertions, not optional features.
+pose_control:
+  use_global_orient: false
+  use_neck_pose: false
+  use_translation: false
+
+output:
+  root: outputs/inpaint
+  # Keep the corrected evidence layout separate from the completed v1 run.
+  name: "00000001_surface_coherent_v3"
+  # Every teacher observation is persisted by default.  If this is disabled,
+  # teacher_previews_per_pose is sampled evenly around the complete camera ring.
+  save_all_teacher_observations: true
+  teacher_previews_per_pose: 24
+  teacher_contact_sheet_tile_size: 128
+  preview_views: 6
+  log_interval: 10
+  preview_interval: 500
+
+# Persist comparable artifacts at every algorithm boundary. A completed stage
+# contains its own model, fixed diagnostic pose/view grid, full 72-frame
+# driving render, metrics and (when available) canonical atlas state.  The four
+# numbered directories are written directly under the run root.
+stage_outputs:
+  enabled: true
+  save_models: true
+  render_diagnostics: true
+  render_driving: true
+  save_driving_frames: true
+  save_driving_masks: true
+  diagnostic_views: 6
+  diagnostic_pose_quantiles: [0.50, 0.80, 0.95]
+  comparison_frames: 12
+  skip_completed: true
+
+data:
+  chemistry_path: talkshow/collection/chemistry_exp.npy
+  height: 512
+  width: 512
+  batch_size: 2
+  eval_height: 512
+  eval_width: 512
+  eval_batch_size: 1
+  n_val_views: 60
+  num_workers: 0
+
+  test_expression_path: assets/test/exp.npy
+  test_pose_path: assets/test/pose.npy
+  test_camera_frame_index: 21
+  validation_expression_path: assets/open_mouth_exp.npy
+  validation_pose_path: assets/open_mouth_pose.npy
+  eval_open_mouth_index: -1
+  eval_pose_mode: reference
+  eval_chemistry_index: 0
+
+  use_dynamic_expression: true
+  reference_pose_probability: 0.25
+
+  chemistry_jaw_outlier_quantile: 0.995
+  chemistry_jaw_max_norm: 1.25
+  chemistry_expression_max_norm: 7.0
+  chemistry_eye_max_norm: 0.8
+  chemistry_open_mouth_quantile: 0.80
+  chemistry_open_mouth_oversample: true
+  chemistry_open_mouth_prob: 0.35
+
+  use_mediapipe_condition: true
+  condition_device: cuda
+  projection_min_depth: 0.0001
+
+# Stage 0. The ratio is s0/s1: normal thin surface disks may have tiny s2 and
+# must not be mistaken for streaks. The scan covers reference, validation and
+# jaw-stratified chemistry poses, then geometry is frozen exactly.
+stability:
+  enabled: true
+  passes: 3
+  pose_quantiles: [0.0, 0.25, 0.50, 0.75, 0.90, 0.98, 0.995]
+  include_validation_pose: true
+  absolute_max_scale: 0.080
+  min_streak_scale: 0.035
+  max_planar_aspect: 8.0
+  # Leave headroom so a cap pulled back from one pose does not numerically
+  # rebound across another pose's different surface Jacobian.
+  repair_margin: 0.90
+
+teacher:
+  # The paper reports t in [20, 400] and five refinement denoising steps.
+  timestep_min: 20
+  timestep_max: 400
+  timestep_schedule: linear
+  num_inference_steps: 5
+  image_size: 512
+
+  # Use a jaw-pose observation grid drawn from every calibrated elevation ring,
+  # rather than silently restricting supervision to one horizontal 12-camera
+  # ring. Twenty-four views balance surface coverage and teacher cost.
+  view_sampling: stratified_all_rings
+  views_per_pose: 24
+  batch_size: 2
+  poses_per_refresh: 4
+  # 6 detail refreshes x 4 poses x 24 views = 576 observations. The reduced
+  # refresh cadence avoids replacing coherent/detail targets too frequently.
+  refresh_interval: 500
+  include_reference_pose: true
+  # Detail refreshes contain the reference plus jaw-rank-stratified chemistry
+  # poses.  The highest stratum is forced to contain an open-mouth sample when
+  # the pose dataset provides one.
+  stratify_dynamic_poses_by_jaw: true
+  require_open_mouth_pose: true
+  # AvatarMakeup trains its coherent base for 10k iterations and refines for
+  # another 3k. Base stores the face in an absolute atlas and each oral surface
+  # in its own residual atlas; Detail directly fits the latest exact
+  # same-pose/same-view teacher bank.
+  coarse_iterations: 10000
+  # 10 base refreshes x 5 poses x 24 views = 1,200 observations. Step 0 uses
+  # deterministic anchors; later refreshes use jaw-stratified dynamic
+  # chemistry expressions.
+  coarse_refresh_interval: 1000
+  coarse_poses_per_refresh: 5
+  coarse_pose_quantiles: [0.50, 0.80, 0.95]
+  include_validation_coarse_pose: true
+
+  prompt: >-
+    a DSLR portrait of a handsome young man with brown lightly wavy
+    pompadour hair and a fade, wearing a navy satin large-pinstripe
+    double-breasted suit, photorealistic, realistic skin and hair,
+    natural facial detail, anatomically natural lips, gums, teeth and
+    mouth interior when visible
+  negative_prompt: >-
+    different person, identity change, face deformation, asymmetry,
+    worst quality, low quality, blurry, jpeg artifacts, watermark, text,
+    duplicate face, extra eyes, extra mouth, deformed eyes, overexposed,
+    high contrast, HDR, neon, glow, bloom, chromatic aberration,
+    oversaturated, unnatural skin color, waxy skin, cartoon, illustration,
+    painted mouth, fused lips, duplicated teeth, floating teeth,
+    malformed teeth, skin-colored mouth interior
+  append_view_prompt: true
+  guidance_scale: 5.0
+  condition_scale: 1.5
+
+  # These refresh/mask defaults are project-specific controls rather than
+  # quantities reported by AvatarMakeup.
+  edit_mask_mode: difference
+  edit_threshold: 0.035
+  edit_softness: 0.08
+  edit_dilation: 5
+  edit_feather: 7
+
+  # Five fixed canonical noise fields make SDEdit noise consistent only at the
+  # same (semantic surface layer, Gaussian UV) across different views.
+  noise_atlas_resolution: 1024
+  noise_seed: 2027
+
+  controlnet:
+    pretrained_model_name_or_path: ../HeadStudio_lib/realistic-vision-51
+    ddim_scheduler_name_or_path: ../HeadStudio_lib/stable-diffusion-v1-5
+    control_type: mediapipe
+    cache_dir: null
+    half_precision_weights: true
+    condition_scale: 1.5
+    enable_memory_efficient_attention: false
+    enable_attention_slicing: false
+    enable_channels_last_format: false
+
+# Detail RGB/mask targets are consumed directly at their exact saved FLAME pose
+# and calibrated camera. No UV atlas or UV confidence gate is used in Detail.
+detail_supervision:
+  mode: direct_teacher
+  base_direct_probability: 0.5
+  open_mouth_probability: 0.5
+
+# This is an extension to AvatarMakeup: the paper uses UV only between the two
+# optimization stages. Here matching (semantic layer, UVD surface) tokens also
+# exchange U-Net features during each joint multi-view denoising trajectory.
+surface_attention:
+  enabled: true
+  # Fail the refresh instead of silently claiming correspondence when the
+  # installed U-Net processors never execute a multi-view attention call.
+  require_runtime_activity: true
+  atlas_resolution: 64
+  max_tokens: 65536
+  min_views: 2
+  strength: 0.65
+  # Oral semantic contributions can be much smaller than whole-face alpha;
+  # use the measured layer threshold so lower teeth/cavity reach attention.
+  alpha_threshold: 0.005
+  uv_jump_threshold: 0.15
+  uv_variance_threshold: 0.0225
+
+fusion:
+  layered_surface:
+    enabled: true
+    layers: [lips, teeth_upper, teeth_lower, oral_cavity]
+    opacity_floor: 0.03
+    # Lower teeth are strongly visible in some open-mouth views but fall below
+    # 0.02 in occluded views; keep weak valid correspondences for propagation.
+    contribution_threshold: 0.005
+    # Convert screen-space teacher deltas back to an approximate intrinsic
+    # layer-color delta. The floor bounds amplification for barely visible
+    # splats while still compensating the weak lower-teeth contribution.
+    residual_decomposition_floor: 0.01
+    # A Base refresh is invalid if the fused atlas gives no effective
+    # per-Gaussian edit weight to either dental surface.
+    required_effective_layers: [teeth_upper, teeth_lower]
+    minimum_effective_gaussians: 1
+    dominance_ratio: 1.20
+
+  resolution: 1024
+  flip_v: false
+  # Optional grayscale canonical-UV mask: white permits refinement and black
+  # protects identity. Leave null to infer the region from teacher differences.
+  edit_allow_mask: null
+  alpha_threshold: 0.20
+  uv_jump_threshold: 0.15
+  # Reject pixels whose alpha-composited first/second UV moments reveal
+  # multiple overlapping surface layers (for example lips/teeth or flyaways).
+  uv_variance_threshold: 0.0225
+  screen_center_power: 2.0
+  alpha_weight_power: 1.0
+  coverage_normalization_quantile: 0.90
+
+  # Cross-view robust consensus. Support counts unique calibrated cameras
+  # (not repeated expressions); one-camera or inconsistent texels get low
+  # confidence during optimization.
+  fusion_chunk_size: 4
+  support_threshold: 0.05
+  huber_delta: 0.08
+  min_view_support: 2
+  variance_scale: 0.0025
+  confidence_power: 1.0
+
+  # Refreshes form an EMA-like loop instead of replacing the target outright.
+  # Edit persistence prevents immediate rollback, while a small decay lets
+  # transient high-t diffusion errors recover because no parsing mask is used.
+  history_weight: 0.5
+  confidence_decay: 0.98
+  edit_decay: 0.95
+
+optimization:
+  # AvatarMakeup schedule: 10k coherent base + 3k detail refinement.
+  iterations: 13000
+  feature_lr: 0.001
+  opacity_lr: 0.00005
+  # A large, formerly transparent splat must not become visible in an unseen
+  # pose merely because a sparse teacher raised its opacity.
+  max_opacity_increase: 0.10
+  # Oral points are covered by direct pose/view targets and independent
+  # semantic atlases, so they need enough range to reveal generated teeth.
+  oral_max_opacity_increase: 0.35
+  betas: [0.9, 0.99]
+  eps: 1.0e-15
+  max_grad_norm: 1.0
+
+loss:
+  # AvatarMakeup uses equal edit/non-edit coefficients of 10.
+  edit_weight: 10.0
+  identity_weight: 10.0
+  layered_oral_weight: 2.0
+  edit_l1_weight: 1.0
+  edit_ssim_weight: 0.20
+  edit_highpass_weight: 0.20
+  highpass_kernel: 5
+
+  # Preserve non-edited identity at full resolution; retain a weaker low-pass
+  # term for illumination/color stability.
+  identity_l1_weight: 1.0
+  identity_lowpass_weight: 0.25
+  identity_resolution: 128
+  identity_kernel: 7
+  alpha_weight: 2.0
+  feature_proximal_weight: 0.05
+  opacity_proximal_weight: 0.05
+  chroma_weight: 0.01
+
+checkpoint:
+  interval: 500
+
+test_render:
+  enabled: true
+  height: 512
+  width: 512
+  fps: 30
+  save_masks: true
+  contact_sheet_frames: 12

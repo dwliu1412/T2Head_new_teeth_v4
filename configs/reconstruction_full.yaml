@@ -1,0 +1,347 @@
+name: "reconstruction_full"
+tag: "run"
+use_timestamp: false
+exp_root_dir: "./outputs"
+seed: 42
+
+# AnimPortrait3D train_all.py (the requested full stage) counterpart.  The
+# entrypoint overrides initialization_ply/params with the mouth-pass export.
+data_type: "reconstruction-finetune-datamodule"
+data:
+  reconstruction_dir: "./outputs/reconstruction/00000001"
+  chemistry_path: "./talkshow/collection/chemistry_exp.npy"
+  height: 512
+  width: 512
+  # train_all.py accumulates three independently sampled pose/view gradients
+  # for each ISM optimizer step, then uses one sample per SDEdit step.
+  batch_size: 1
+  surface_consistent_batch: false
+  eval_height: 512
+  eval_width: 512
+  eval_batch_size: 1
+  n_val_views: 8
+  num_workers: 0
+  test_expression_path: "./assets/test/exp.npy"
+  test_pose_path: "./assets/test/pose.npy"
+  test_camera_frame_index: 42
+  validation_expression_path: "./assets/open_mouth_exp.npy"
+  validation_pose_path: "./assets/open_mouth_pose.npy"
+  eval_open_mouth_index: -1
+
+  train_pose_mode: "mixed"
+  train_azimuth_range: null
+  # train_all.py samples pitch=70..110, i.e. elevation=-20..20.  Leaving this
+  # unbounded admitted the +45-degree FaceLift ring (up to +58.6 degrees after
+  # alignment), which is outside the reference training distribution.
+  train_elevation_range: [-20.0, 20.0]
+  # GSAvatar samples the face hemisphere 70% of the time. Uniform sampling
+  # over the calibrated rows gave this identity only 38% face-region steps.
+  train_front_hemisphere_probability: 0.70
+  use_dynamic_expression: true
+  reference_pose_probability: 0.0
+  eval_pose_mode: "open_mouth"
+  chemistry_jaw_outlier_quantile: 0.999
+  chemistry_jaw_max_norm: 0.0
+  chemistry_expression_max_norm: 30.0
+  chemistry_eye_max_norm: 1.0
+  chemistry_open_mouth_quantile: 0.80
+  chemistry_open_mouth_oversample: true
+  chemistry_open_mouth_prob: 0.40
+  condition_type: "animportrait3d_normal_seg"
+  use_condition: true
+  use_mediapipe_condition: false
+  condition_device: "cuda"
+  projection_min_depth: 1.0e-5
+  animportrait3d_assets_dir: "./ckpts/animportrait3d_normal_seg_flame_teeth"
+
+system_type: "head-3dgs-reconstruction-finetune-system"
+system:
+  initialization_dir: ${data.reconstruction_dir}
+  initialization_ply: "./outputs/refinement/00000001/mouth/save/mouth.ply"
+  initialization_params: "./outputs/refinement/00000001/mouth/save/mouth_params.npz"
+  optimization_stage: "full"
+  prompt: "a DSLR portrait of a photorealistic human head"
+
+  diffusion_weight: 1.0
+  diffusion_background_weight: 0.0
+  guidance_warmup_steps: 0
+  reference_resolution: 128
+  reference_kernel: 7
+  reference_alpha_weight: 0.25
+  # train_all.py has no static Stage-1 replay. The previous adaptive weight
+  # saturated at 10 and explicitly pulled SDEdit back to the bad ears/clothes.
+  reference_weight: 0.0
+  reference_tolerance: 0.004
+  reference_dual_lr: 0.0
+  reference_max_weight: 0.0
+  # Keep geometry/silhouette tied to the calibrated reconstruction without
+  # replaying its bad RGB texture.  This specifically blocks new foreground
+  # opacity from spreading into the white background.
+  silhouette_weight: 1.0
+  silhouette_spill_weight: 5.0
+  guidance_reference_dilation: 8
+  chroma_weight: 0.0
+  chroma_threshold: 0.85
+  max_world_scale: 0.08
+  world_scale_weight: 1.0e4
+
+  # train_all.py uses threshold_scale=0.2 and lambda_scale=5e7 in ISM,
+  # followed by lambda_scale=1e4 in SDEdit.  Those terms were missing from
+  # this port.  The hard aligned-world guard is UVD-specific: it catches
+  # sampled FLAME Jacobians that turn a valid canonical splat into a needle.
+  scale_stability:
+    enabled: true
+    threshold: 0.2
+    ism_weight: 5.0e7
+    sdedit_weight: 1.0e4
+    hard_max_canonical_scale: 0.25
+    hard_max_world_scale: 0.08
+    mask_regions_to_reference: true
+
+  optimization:
+    # 1000 ISM steps followed by 750 SDEdit reconstruction steps.
+    max_steps: 1750
+    ism_accumulate_grad_batches: 3
+    geometry_start: 0
+    # Exact GSAvatar full-stage rates. UVD uses uv+d as its position analogue.
+    final_lr_ratio: 1.0
+    feature_lr: 3.75e-3
+    opacity_lr: 7.5e-2
+    uv_lr: 2.985e-5
+    d_lr: 2.985e-5
+    scale_lr: 2.55e-2
+    rotation_lr: 1.5e-3
+    max_grad_norm: 0.0
+
+  proximal:
+    uv: 0.0
+    feature: 0.0
+    opacity: 0.0
+    d: 0.0
+    scale: 0.0
+    rotation: 0.0
+
+  mouth:
+    points: 0
+    rgb: [0.025, 0.012, 0.012]
+    opacity: 0.35
+    initial_scale_min: 5.0e-4
+    initial_scale_max: 1.0e-2
+    max_scale: 0.015
+    max_abs_d: 0.002
+    barrier_weight: 0.02
+
+  mouth_guidance_regions: ["lips", "teeth", "oral_cavity"]
+  mouth_guidance_dilation: 24
+  # Legacy behavior when full_protection is disabled.
+  freeze_dental_when_closed: true
+
+  # Mouth refinement already produced good teeth/cavity for this identity,
+  # and the incoming mouth PLY also has clean eyes.  Full-stage zoomed ISM was
+  # tripling the eye topology and increasing eye opacity until both eyes became
+  # solid blobs; its mouth branch had the largest regional gradient and erased
+  # the learned teeth.  Render these regions as context but keep their point
+  # parameters and topology exactly as they enter the full pass.
+  full_protection:
+    enabled: true
+    freeze_eyes: true
+    freeze_mouth: true
+    freeze_dental: true
+    protect_from_densification: true
+    mask_face_loss: true
+
+  regional_guidance:
+    enabled: true
+    abstract_prompt: "a photorealistic human face with natural skin, eyes, lips and teeth"
+    full_weight: 1.0
+    face_weight: 1.0
+    # Mouth has a dedicated preceding stage, and this identity's incoming PLY
+    # already has clean eyes.  In the UVD port the CFG=100 eye/mouth sub-crops
+    # were destructive even after global scale clipping, so full focuses on
+    # face/ear/hair/clothing and preserves those regions.
+    left_eye_weight: 0.0
+    right_eye_weight: 0.0
+    mouth_weight: 0.0
+    exclude_face_from_full: true
+    exclude_face_box_from_full: true
+    # Global full-avatar ISM uses the base UNet; only zoomed regions use the
+    # AnimPortrait3D normal+seg ControlNet.
+    full_use_control: false
+    regional_use_control: true
+    crop_regions: true
+    crop_from_landmarks: true
+    crop_reference_resolution: 896
+    crop_reference_sizes:
+      face: 512
+      left_eye: 116
+      right_eye: 116
+      mouth: 200
+    crop_padding: 8
+    square_crops: true
+    full_crop_loss: true
+    dilation:
+      face: 8
+      left_eye: 12
+      right_eye: 12
+      mouth: 20
+
+  # Canonical correspondence used only by UVD-consistent ISM.  Semantic UVD
+  # is cropped with every full/face/eye/mouth branch; raw ISM and UVD-ISM use
+  # identical inversion, optimization, region weights, and densification.
+  uvd_surface_flow:
+    alpha_threshold: 0.05
+    contribution_threshold: 0.01
+    dominance_ratio: 1.10
+    # Reject pixels whose alpha-weighted UVD samples mix a seam or multiple
+    # surfaces (maximum per-channel canonical variance).
+    max_uvd_variance: 0.0025
+    opacity_floor: 0.0
+    d_range: null
+    d_padding_ratio: 0.05
+
+  # Matches train_all.py Stage 2.  That script releases ControlNet before
+  # SDEdit; semantic regions are still zoomed into independent img2img crops,
+  # while the full-image target repairs the complement of the face.
+  sdedit:
+    enabled: true
+    # Default remains the per-view AnimPortrait3D teacher.  Use
+    # --sdedit-mode flame-surface for joint canonical-surface K/V memory.
+    mode: "independent"
+    start_step: 1000
+    # train_all.py reloads the first-phase PLY and calls training_setup() before
+    # SDEdit, which gives this phase fresh Adam moments and step counters.
+    reset_optimizer_at_start: true
+    strength: 0.30
+    num_inference_steps: 20
+    guidance_scale: 7.5
+    negative_prompt: "oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull"
+    weight: 1.0
+    l1_weight: 0.8
+    lpips_weight: 0.2
+    lpips_net: "vgg"
+    require_lpips: true
+    crop_main: false
+    crop_regions: true
+    crop_padding: 8
+    square_region_crops: true
+    regional_full_crop_loss: true
+    regional_native_crop_loss: true
+    main_use_control: false
+    regional_use_control: false
+    # train_all.py's SDEdit calls use the base face/eye/mouth prompts directly.
+    view_dependent_prompting: false
+    region_weights:
+      face: 1.0
+      left_eye: 0.0
+      right_eye: 0.0
+      mouth: 0.0
+    surface_memory:
+      enabled: false
+      views: 4
+      atlas_resolution: 64
+      max_tokens: 65536
+      min_views: 2
+      max_memory_views: 4
+      strength: 0.65
+      start_progress: 0.45
+      end_progress: 1.0
+      exclude_self: false
+      processor_patterns: ["up_blocks.2", "up_blocks.3"]
+      alpha_threshold: 0.005
+      contribution_threshold: 0.005
+      variance_threshold: 0.0025
+      depth_tolerance: 0.01
+      dominance_ratio: 1.10
+      opacity_floor: 0.03
+      require_runtime_activity: true
+
+  # train_all.py densifies during ISM at optimizer iterations 50 and 100.
+  # Eye/dental points are already complete before this pass, so spend the
+  # limited UVD budget on face/ear/hair/clothing surfaces.
+  densification:
+    enabled: true
+    steps: [50, 100]
+    grad_threshold: 2.0e-4
+    min_opacity: 0.005
+    max_screen_size: 20.0
+    percent_dense: 0.01
+    max_gaussians: 2000000
+    protect_dental: true
+    exclude_dental: true
+
+  # Capture the exact 1000-step ISM/UVD-consistent-ISM result before SDEdit
+  # update. Outputs are full_ism.* (or full_uvd_sfd.*) plus a complete
+  # *_driving_test frame directory and MP4.
+  first_phase_artifacts:
+    enabled: true
+    save_gaussian: true
+    render_driving_test: true
+    driving_fps: 30
+  export_name: "full"
+
+  guidance_type: "controlnet-depth-guidance"
+  guidance:
+    pretrained_model_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    pretrained_vae_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/sd-vae-ft-ema"
+    ddim_scheduler_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    edit_use_pipeline_scheduler: true
+    control_type: "animportrait3d"
+    pretrained_controlnet_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/AnimPortrait3D_controlnet"
+    controlnet_conditioning_channels: 4
+    guidance_scale: 100.0
+    condition_scale: 1.0
+    diffusion_steps: 20
+    cfg_unconditional_source: "negative"
+    vae_encode_mode: false
+    min_step_percent: 0.015
+    max_step_percent: [0, 0.30, 0.015, 999]
+    grad_clip: null
+    half_precision_weights: true
+    coupled_batch: true
+    coupled_share_t: true
+    coupled_share_noise: false
+    coupled_mean_grad: false
+    coupled_apply_to_sds: true
+    use_nfsd: false
+    use_dsd: false
+    use_uvd_surface_flow: false
+    uvd_flow_noise_seed: 0
+    uvd_flow_uv_resolution: 512
+    uvd_flow_depth_resolution: 8
+    uvd_flow_surface_layers: 5
+    uvd_flow_min_distinct_cells: 8
+    use_ism: true
+    ism_variant: "animportrait3d"
+    ism_delta_t: 50
+    ism_sample_at_max_step: true
+    use_vsd: false
+
+  prompt_processor_type: "stable-diffusion-prompt-processor"
+  prompt_processor:
+    pretrained_model_name_or_path: "H:/work2/others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE"
+    prompt: ${system.prompt}
+    view_prompt_style: "animportrait3d"
+    negative_prompt: "tattoo, blur, lowres, bad anatomy, bad hands, cropped, worst quality, low quality, blurry, jpeg artifacts, watermark, text, duplicate face, extra eyes, extra mouth, deformed eyes, asymmetry, overexposed, HDR, neon, glow, chromatic aberration, oversaturated, waxy skin, cgi, cartoon, fused lips, duplicated teeth, floating teeth, malformed teeth"
+    use_cache: true
+    spawn: true
+
+  loggers:
+    wandb:
+      enable: false
+      project: "t2head-full-refinement"
+      name: null
+
+trainer:
+  max_steps: 1750
+  log_every_n_steps: 1
+  num_sanity_val_steps: 0
+  val_check_interval: 250
+  enable_progress_bar: true
+  # Reference GSAvatar optimization is FP32. This also makes the manual
+  # three-sample accumulation count every optimizer step deterministically.
+  precision: "32-true"
+
+checkpoint:
+  save_last: true
+  save_top_k: -1
+  every_n_train_steps: 250
