@@ -382,6 +382,7 @@ class FlamePointswRandomExp:
         # imgs = draw_landmarks(canvas, img_lmk_468[0].long().detach().cpu().numpy())
         # imgs = np.array(imgs, dtype=np.int32)
         # imgs = draw_openpose(img_lmk.detach().cpu(), self.image_size, self.image_size)
+        imgs = np.ascontiguousarray(imgs[..., ::-1])
         return imgs / 255.0
 
     def get_cond_depth(self, vertices, faces, cameras, mesh_vis=False, mesh_rgb=False):

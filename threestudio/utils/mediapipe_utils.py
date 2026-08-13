@@ -129,4 +129,4 @@ def draw_landmarks_468(
         cv2.circle(image, left_iris, left_eye_draw.circle_radius, left_eye_draw.color, thickness=-1)
     if right_iris is not None:
         cv2.circle(image, right_iris, right_eye_draw.circle_radius, right_eye_draw.color, thickness=-1)
-    return image[:, :, ::-1]  # flip BGR
+    return image

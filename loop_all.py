@@ -271,9 +271,8 @@ class Avatar:
     def get_flame_cond(self, dist, elev_deg, azim_deg, fovy_deg, expression, jaw_pose, neck_pose, leye_pose, reye_pose,
                        at=torch.tensor(((0, 0, 0),)), up=torch.tensor(((0, 0, 1),))):
         at, up = at.to(torch.float), up.to(torch.float)
-        flame_depths = self.skel.get_cond(dist, elev_deg, azim_deg, at, up, fovy_deg, expression=expression,
-                                          jaw_pose=jaw_pose, neck_pose=neck_pose, lmk=True, mediapipe=True,
-                                          mesh_vis=True)
+        flame_depths = self.skel.get_cond(dist, elev_deg, azim_deg, at, up, fovy_deg, expression=expression,leye_pose=leye_pose, reye_pose=reye_pose,
+                                          jaw_pose=jaw_pose, neck_pose=neck_pose, lmk=True, mediapipe=True, mesh_vis=True, gaussian_camera_convention=True)
         return flame_depths
 
     def get_camera(self, dist, elev, azim, fovy_deg=70.0):
@@ -449,7 +448,8 @@ class Trainer:
         self.max_grad = cfg['avatar']['max_grad']
 
         diffusion_path = '../HeadStudio_lib/realistic-vision-51'
-        vae_path = '../../others/AnimPortrait3D/pretrained_model/sd-vae-ft-ema'
+        diffusion_path = '../../others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE'
+        vae_path = '../HeadStudio_lib/sd-vae-ft-mse'
         controlnet_path = '../HeadStudio_lib/ControlNetMediaPipeFace'
 
         vae = AutoencoderKL.from_pretrained(vae_path,torch_dtype=torch.float16).to(device)
@@ -549,19 +549,39 @@ class Trainer:
                 controlnet_conditioning_image = (torch.clamp(mesh, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
                 controlnet_conditioning_image = Image.fromarray(controlnet_conditioning_image)
 
+                refined_image_nocontrol = self.sdeditpipeline(
+                    controlnet = None,
+                    prompt= 'a DSLR portrait of a handsome young brown lightly wavy Pompadour with fade, muscled sportsman in navy satin large pinstripe double-breasted suit, pompadour haircut',
+                    negative_prompt='oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull',
+                    image=original_image,
+                    controlnet_conditioning_image=None,
+                    width=original_image.size[0],
+                    height=original_image.size[1],
+                    strength=0.3, 
+                    num_inference_steps=50, 
+                    guidance_scale =7.5,
+                ).images[0].resize((512, 512))
+
                 refined_image = self.sdeditpipeline(
                     controlnet = self.controlnet,
                     prompt= 'a DSLR portrait of a handsome young brown lightly wavy Pompadour with fade, muscled sportsman in navy satin large pinstripe double-breasted suit, pompadour haircut',
-                    negative_prompt='"oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull"',
+                    negative_prompt='oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull',
                     image=original_image,
                     controlnet_conditioning_image=controlnet_conditioning_image,
                     width=original_image.size[0],
                     height=original_image.size[1],
                     strength=0.3, 
-                    num_inference_steps=20, 
+                    num_inference_steps=50, 
                     guidance_scale =7.5,
-                    controlnet_conditioning_scale=1.5
+                    controlnet_conditioning_scale=0.65,
+                    controlnet_guidance_start=0.0,
+                    controlnet_guidance_end=0.55,
                 ).images[0].resize((512, 512))
+
+                original_image.save('cur.png')
+                controlnet_conditioning_image.save('controlnet_conditioning_image.png')
+                refined_image_nocontrol.save('refined_nocontrol.png')
+                refined_image.save('refined.png')
 
                 g = torch.Generator(device=self.device)
                 idx_int = int(idx_t.detach().cpu().item())

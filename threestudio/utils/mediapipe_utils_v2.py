@@ -110,7 +110,7 @@ def draw_landmarks_105(image, landmark_list, connections=ConnectionDict):
                     drawing_spec.thickness,
                 )
 
-        return img[:, :, ::-1]  # flip BGR
+        return img
 
     draw_image = np.stack([draw_landmarks(image[i], landmark_list[i])
                            for i in range(bs)], axis=0)
