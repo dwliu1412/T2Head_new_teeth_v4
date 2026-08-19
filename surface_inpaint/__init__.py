@@ -15,6 +15,7 @@ from .surface_memory_attention import (
 from .stability import (
     StabilityConfig,
     sanitize_uvd_covariances,
+    stabilize_face_local_covariances,
     stabilize_uvd_covariances,
 )
 
@@ -29,5 +30,6 @@ __all__ = [
     "install_surface_memory_attention",
     "StabilityConfig",
     "sanitize_uvd_covariances",
+    "stabilize_face_local_covariances",
     "stabilize_uvd_covariances",
 ]

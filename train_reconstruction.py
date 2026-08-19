@@ -19,12 +19,13 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+from pytorch3d.transforms import matrix_to_quaternion
 from tqdm import tqdm
 
 from gaussiansplatting.gaussian_renderer import render
 from gaussiansplatting.scene.gaussian_flame_face import GaussianFlameUVModel
 from gaussiansplatting.scene.gaussian_model import GaussianModel
-from gaussiansplatting.utils.general_utils import strip_symmetric
+from gaussiansplatting.utils.general_utils import build_rotation
 from gaussiansplatting.utils.graphics_utils import getProjectionMatrix
 from gaussiansplatting.utils.loss_utils import l1_loss, ssim
 
@@ -172,42 +173,90 @@ def set_training_pose(
     model._translation = zeros
 
 
+def apply_similarity_to_gaussians(
+    means: torch.Tensor,
+    scales: torch.Tensor,
+    rotations: torch.Tensor,
+    alignment: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply a possibly reflected similarity without forming covariance."""
+
+    linear, translation = alignment[:3, :3], alignment[:3, 3]
+    similarity_scale = linear.square().sum().div(3.0).sqrt()
+    if not bool(torch.isfinite(similarity_scale).item()) or float(
+        similarity_scale.item()
+    ) <= 0.0:
+        raise ValueError("Alignment has an invalid similarity scale")
+    orthogonal = linear / similarity_scale
+    identity = torch.eye(
+        3, dtype=orthogonal.dtype, device=orthogonal.device
+    )
+    if not torch.allclose(
+        orthogonal.T @ orthogonal, identity, rtol=1e-4, atol=1e-5
+    ):
+        raise ValueError("Alignment linear block is not a similarity transform")
+
+    means = means @ linear.T + translation
+    rotation_matrix = torch.matmul(
+        orthogonal[None], build_rotation(rotations)
+    )
+    # The FaceLift alignment intentionally contains a handedness reflection.
+    # A sign flip of one ellipsoid axis makes the matrix proper while leaving
+    # R diag(s^2) R^T unchanged, so it can still be stored as a quaternion.
+    improper = torch.det(rotation_matrix) < 0.0
+    if improper.any():
+        rotation_matrix = rotation_matrix.clone()
+        rotation_matrix[improper, :, 2] *= -1.0
+    rotations = F.normalize(matrix_to_quaternion(rotation_matrix), dim=-1)
+    scales = scales * similarity_scale.abs()
+    return means, scales, rotations
+
+
+def aligned_scaling_rotation(
+    model: GaussianFlameUVModel,
+    alignment: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return final-scene means, scales and rotations after posing FLAME."""
+
+    vertices, normals = model._flame_verts_and_normals()
+    means = model._map_uvd_to_xyz(
+        torch.cat([model._uv, model._d], dim=1), vertices, normals
+    )
+    scales, rotations = model._deformed_scaling_rotation(vertices)
+    return apply_similarity_to_gaussians(
+        means, scales, rotations, alignment
+    )
+
+
 def aligned_geometry(
     model: GaussianFlameUVModel,
     alignment: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    vertices, normals = model._flame_verts_and_normals()
-    means = model._map_uvd_to_xyz(torch.cat([model._uv, model._d], dim=1), vertices, normals)
-    covariance = model._world_covariance_matrix(
-        model._uvd_jacobian(vertices, normals),
-        model.get_scaling,
-        model._rotation,
+    """Compatibility helper returning covariance built from explicit axes."""
+
+    means, scales, rotations = aligned_scaling_rotation(model, alignment)
+    covariance = model._covariance_matrix_from_scaling_rotation(
+        scales, rotations
     )
-    linear, translation = alignment[:3, :3], alignment[:3, 3]
-    means = means @ linear.T + translation
-    covariance = linear[None] @ covariance @ linear.T[None]
     return means, covariance
 
 
 def packed_geometry(
     model: GaussianFlameUVModel,
     alignment: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    means, covariance = aligned_geometry(model, alignment)
-    return means, strip_symmetric(covariance)
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return aligned_scaling_rotation(model, alignment)
 
 
 def world_scale_regularization(
-    covariance: torch.Tensor,
+    world_scales: torch.Tensor,
     trainable_mask: torch.Tensor,
     threshold: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """AnimPortrait3D-style hinge loss on aligned world-space scales."""
-    symmetric = 0.5 * (covariance + covariance.transpose(1, 2))
-    world_scales = torch.linalg.eigvalsh(symmetric).clamp_min(1e-12).sqrt()
     trainable_scales = world_scales[trainable_mask]
     if trainable_scales.numel() == 0:
-        return covariance.sum() * 0.0, trainable_scales
+        return world_scales.sum() * 0.0, trainable_scales
     regularizer = F.relu(trainable_scales - float(threshold)).norm(dim=1).mean()
     return regularizer, trainable_scales
 
@@ -218,7 +267,7 @@ def render_view(
     alignment: torch.Tensor,
     pipeline: SimpleNamespace,
     background: torch.Tensor,
-    geometry: tuple[torch.Tensor, torch.Tensor] | None = None,
+    geometry: tuple[torch.Tensor, ...] | None = None,
     override_color: torch.Tensor | None = None,
     override_opacity: torch.Tensor | None = None,
 ):
@@ -384,11 +433,13 @@ def train(
             )
             trainable_mask = ~frozen_mask
 
-            # Reuse the exact aligned covariance passed to the renderer.  This
-            # keeps the threshold in final scene units and catches scale growth
-            # caused by both UVD deformation and the FaceLift alignment.
-            means, covariance = aligned_geometry(model, alignment)
-            geometry = (means, strip_symmetric(covariance))
+            # FLAME is posed first; the learned face-local ellipsoid is then
+            # composed into final-scene scale/rotation and passed directly to
+            # the rasterizer.  No UVD covariance Jacobian is involved.
+            means, world_scales, world_rotations = aligned_scaling_rotation(
+                model, alignment
+            )
+            geometry = (means, world_scales, world_rotations)
             package = render_view(
                 view,
                 model,
@@ -405,7 +456,7 @@ def train(
                 + float(training_cfg["dssim_weight"]) * dssim
             )
             scale_regularizer, trainable_world_scales = world_scale_regularization(
-                covariance,
+                world_scales,
                 trainable_mask,
                 threshold_scale,
             )
@@ -553,8 +604,7 @@ def save_world_ply(
     alignment: torch.Tensor,
     path: Path,
 ) -> None:
-    means, covariance = aligned_geometry(model, alignment)
-    scales, rotations = model._covariance_to_scaling_rotation(covariance)
+    means, scales, rotations = aligned_scaling_rotation(model, alignment)
     world = GaussianModel(model.max_sh_degree)
     world.active_sh_degree = model.active_sh_degree
     world._xyz = means.detach()
@@ -831,6 +881,8 @@ def main() -> None:
             facelift_from_training=alignment.detach().cpu().numpy(),
             flame_scale=np.float32(model_cfg["flame_scale"]),
             spatial_lr_scale=np.float32(model_cfg["spatial_lr_scale"]),
+            scale_rotation_space=np.asarray("flame_face_local_v1"),
+            representation_schema_version=np.int64(2),
         )
         save_final_views(
             views,

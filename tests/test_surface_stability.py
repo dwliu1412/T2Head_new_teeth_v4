@@ -22,8 +22,8 @@ def diagonal_covariance(scales):
     return torch.diag_embed(values.square())
 
 
-class FakeUVDModel:
-    def __init__(self, canonical_scales, jacobians):
+class FakeFaceLocalModel:
+    def __init__(self, canonical_scales, transforms):
         scales = torch.tensor(canonical_scales, dtype=DTYPE)
         identity_quaternion = torch.zeros(
             (scales.shape[0], 4), dtype=DTYPE
@@ -32,8 +32,8 @@ class FakeUVDModel:
         self._scaling = torch.nn.Parameter(scales.log())
         self._rotation = torch.nn.Parameter(identity_quaternion)
         self.scaling_inverse_activation = torch.log
-        self.jacobians = {
-            key: value.to(dtype=DTYPE) for key, value in jacobians.items()
+        self.transforms = {
+            key: value.to(dtype=DTYPE) for key, value in transforms.items()
         }
         self.current_pose = None
 
@@ -45,8 +45,16 @@ class FakeUVDModel:
     def get_rotation(self):
         return torch.nn.functional.normalize(self._rotation, dim=-1)
 
-    def current_uvd_jacobian(self):
-        return self.jacobians[self.current_pose]
+    @property
+    def get_local_scaling(self):
+        return self.get_scaling
+
+    @property
+    def get_local_rotation(self):
+        return self.get_rotation
+
+    def current_covariance_transform(self):
+        return self.transforms[self.current_pose]
 
 
 class SurfaceStabilityMathTests(unittest.TestCase):
@@ -200,7 +208,7 @@ class SurfaceStabilityModelTests(unittest.TestCase):
         stretched = torch.diag(
             torch.tensor([5.0, 1.0, 1.0], dtype=DTYPE)
         ).unsqueeze(0)
-        model = FakeUVDModel(
+        model = FakeFaceLocalModel(
             [[0.010, 0.009, 0.001]],
             {"reference": identity, "stretched": stretched},
         )

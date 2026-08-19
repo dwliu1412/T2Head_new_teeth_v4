@@ -844,16 +844,17 @@ class UVDAvatar:
         from gaussiansplatting.scene.gaussian_flame_face import (
             GaussianFlameUVModel,
         )
-        from gaussiansplatting.utils.general_utils import strip_symmetric
         from gaussiansplatting.utils.sh_utils import RGB2SH, SH2RGB
-        from train_reconstruction import OpenCVCamera, aligned_geometry
+        from train_reconstruction import (
+            OpenCVCamera,
+            aligned_scaling_rotation,
+        )
 
         self._render = render
-        self._strip_symmetric = strip_symmetric
         self._RGB2SH = RGB2SH
         self._SH2RGB = SH2RGB
         self._OpenCVCamera = OpenCVCamera
-        self._aligned_geometry = aligned_geometry
+        self._aligned_geometry = aligned_scaling_rotation
         self.device = device
         self.reconstruction_dir = reconstruction_dir
 
@@ -889,6 +890,9 @@ class UVDAvatar:
             dtype=torch.float32,
             device=device,
         ).reshape(4, 4)
+        self.alignment_scale = float(
+            self.alignment[:3, :3].square().sum().div(3.0).sqrt().item()
+        )
         self.reference_pose = (expression, jaw, eyes[:, :3], eyes[:, 3:6])
         self.gaussian._shape.data.copy_(shape)
         self.gaussian._shape.requires_grad_(False)
@@ -973,7 +977,9 @@ class UVDAvatar:
     ) -> int:
         if not bool(mask.any()) or maximum <= 0.0:
             return 0
-        world = self.gaussian.get_world_scale()[:, 0]
+        world = (
+            self.gaussian.get_world_scale()[:, 0] * self.alignment_scale
+        )
         ratio = (float(maximum) / world.clamp_min(1.0e-8)).clamp(max=1.0)
         changed = mask & (ratio < 1.0)
         self.gaussian._scaling.data[changed] = (
@@ -989,29 +995,29 @@ class UVDAvatar:
         indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
         if indices.numel() == 0:
             return 0
-        vertices, normals = self.gaussian._flame_verts_and_normals()
-        jacobian = self.gaussian._uvd_jacobian(
-            vertices,
-            normals,
-            face_idx=self.gaussian._face_idx[indices],
-            uv=self.gaussian._uv[indices],
-            d=self.gaussian._d[indices],
+        vertices, _ = self.gaussian._flame_verts_and_normals()
+        world_scale = (
+            self.gaussian.get_world_scale()[indices] * self.alignment_scale
         )
-        inverse = self.gaussian._stable_jacobian_inverse(jacobian)
-        world_scale = self.gaussian.get_world_scale()[indices]
         radius = world_scale.prod(dim=-1).clamp_min(1.0e-18).pow(1.0 / 3.0)
         radius = radius.clamp(
             min=float(self.gaussian.SIGMA_FLOOR),
             max=float(maximum),
         )
-        covariance = radius[:, None, None].square() * torch.bmm(
-            inverse, inverse.transpose(1, 2)
+        _, face_scale = self.gaussian._face_properties(
+            vertices, self.gaussian._face_idx[indices]
         )
-        scale, rotation = self.gaussian._covariance_to_scaling_rotation(
-            covariance
+        local_scale = (
+            radius[:, None] / (self.alignment_scale * face_scale)
+        ).expand(-1, 3).contiguous()
+        local_rotation = torch.zeros(
+            (indices.numel(), 4),
+            dtype=self.gaussian._rotation.dtype,
+            device=self.gaussian.device,
         )
-        self.gaussian._scaling.data[indices] = scale.log()
-        self.gaussian._rotation.data[indices] = rotation
+        local_rotation[:, 0] = 1.0
+        self.gaussian._scaling.data[indices] = local_scale.log()
+        self.gaussian._rotation.data[indices] = local_rotation
         return int(indices.numel())
 
     @torch.no_grad()
@@ -1029,7 +1035,9 @@ class UVDAvatar:
             return stats
 
         if bool(config.get("isotropize_streaks", True)):
-            world_scale = self.gaussian.get_world_scale()
+            world_scale = (
+                self.gaussian.get_world_scale() * self.alignment_scale
+            )
             aspect = world_scale[:, 0] / world_scale[:, -1].clamp_min(1.0e-8)
             streaks = (
                 (
@@ -1216,15 +1224,14 @@ class UVDAvatar:
 
     def _current_geometry(
         self, differentiable: bool
-    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> Tuple[Tuple[torch.Tensor, ...], torch.Tensor]:
         context = torch.enable_grad() if differentiable else torch.no_grad()
         with context, torch.cuda.amp.autocast(enabled=False):
-            means, covariance = self._aligned_geometry(
+            means, scales, rotations = self._aligned_geometry(
                 self.gaussian, self.alignment
             )
-            eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
-            world_scale = eigenvalues.sqrt().amax(dim=-1)
-            packed = (means, self._strip_symmetric(covariance))
+            world_scale = scales.amax(dim=-1)
+            packed = (means, scales, rotations)
         return packed, world_scale
 
     def render_batch(

@@ -82,34 +82,42 @@ system:
   guidance_reference_dilation: 8
   chroma_weight: 0.0
   chroma_threshold: 0.85
-  max_world_scale: 0.08
+  max_world_scale: 0.05
   world_scale_weight: 1.0e4
 
-  # train_all.py uses threshold_scale=0.2 and lambda_scale=5e7 in ISM,
-  # followed by lambda_scale=1e4 in SDEdit.  Those terms were missing from
-  # this port.  The hard aligned-world guard is UVD-specific: it catches
-  # sampled FLAME Jacobians that turn a valid canonical splat into a needle.
+  # Face-local scale is normalized by the parent-face size and therefore has
+  # no scene-global absolute threshold. All full-stage limits below operate
+  # on aligned world axes. The reference terms compare against the incoming
+  # mouth avatar under the same FLAME pose, preserving its legitimate
+  # anisotropy while preventing new needle-like growth.
   scale_stability:
     enabled: true
-    threshold: 0.2
-    ism_weight: 5.0e7
-    sdedit_weight: 1.0e4
-    hard_max_canonical_scale: 0.25
-    hard_max_world_scale: 0.08
+    hard_max_world_scale: 0.05
+    # Absolute aspect-ratio guard for trainable splats. Unlike the relative
+    # envelope below, this also repairs needle-like anisotropy inherited from
+    # the incoming avatar while leaving frozen eyes/mouth/dental rows intact.
+    max_world_anisotropy: 30.0
+    world_anisotropy_weight: 10000.0
+    reference_growth_limit: 1.5
+    reference_growth_weight: 10000.0
+    reference_anisotropy_growth_limit: 1.5
+    reference_anisotropy_weight: 10000.0
     mask_regions_to_reference: true
 
   optimization:
-    # 1000 ISM steps followed by 750 SDEdit reconstruction steps.
+    # 1000 first-guidance (ISM or UVD-SFD) steps followed by 750 SDEdit steps.
     max_steps: 1750
     ism_accumulate_grad_batches: 3
     geometry_start: 0
-    # Exact GSAvatar full-stage rates. UVD uses uv+d as its position analogue.
+    # Geometry follows the GSAvatar full-stage rates. Appearance/opacity use a
+    # 10x trust-region reduction because unconstrained ISM made previously
+    # invisible splats opaque and highly saturated.
     final_lr_ratio: 1.0
-    feature_lr: 3.75e-3
-    opacity_lr: 7.5e-2
+    feature_lr: 7.5e-4
+    opacity_lr: 1.5e-2
     uv_lr: 2.985e-5
     d_lr: 2.985e-5
-    scale_lr: 2.55e-2
+    scale_lr: 2.55e-3
     rotation_lr: 1.5e-3
     max_grad_norm: 0.0
 
@@ -149,6 +157,17 @@ system:
     freeze_dental: true
     protect_from_densification: true
     mask_face_loss: true
+    # Preserve the incoming mouth render under the exact sampled camera and
+    # FLAME pose. The semantic mask is rendered without scene occlusion, so a
+    # trainable cheek/chin splat moving in front of the mouth is still
+    # penalized by RGB, alpha, and expected-depth disagreement.
+    mouth_screen_preservation:
+      enabled: true
+      dilation: 12
+      rgb_weight: 100.0
+      alpha_weight: 50.0
+      depth_weight: 10.0
+      alpha_threshold: 0.05
 
   regional_guidance:
     enabled: true
@@ -185,9 +204,9 @@ system:
       right_eye: 12
       mouth: 20
 
-  # Canonical correspondence used only by UVD-consistent ISM.  Semantic UVD
-  # is cropped with every full/face/eye/mouth branch; raw ISM and UVD-ISM use
-  # identical inversion, optimization, region weights, and densification.
+  # Canonical correspondence used only by UVD-SFD.  Semantic UVD is cropped
+  # with every full/face/eye/mouth branch.  The same CFD/UVD noise constructs
+  # x_t and x_s directly for the conditional-minus-null score difference.
   uvd_surface_flow:
     alpha_threshold: 0.05
     contribution_threshold: 0.01
@@ -255,9 +274,8 @@ system:
       opacity_floor: 0.03
       require_runtime_activity: true
 
-  # train_all.py densifies during ISM at optimizer iterations 50 and 100.
-  # Eye/dental points are already complete before this pass, so spend the
-  # limited UVD budget on face/ear/hair/clothing surfaces.
+  # Preserve the verified mouth-pass topology by default.  Passing explicit
+  # --densification-steps to train_full.py opts back into this experiment.
   densification:
     enabled: true
     steps: [50, 100]
@@ -269,7 +287,7 @@ system:
     protect_dental: true
     exclude_dental: true
 
-  # Capture the exact 1000-step ISM/UVD-consistent-ISM result before SDEdit
+  # Capture the exact 1000-step ISM/UVD-SFD result before SDEdit
   # update. Outputs are full_ism.* (or full_uvd_sfd.*) plus a complete
   # *_driving_test frame directory and MP4.
   first_phase_artifacts:

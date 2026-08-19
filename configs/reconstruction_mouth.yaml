@@ -82,7 +82,7 @@ system:
   world_scale_weight: 10.0
 
   optimization:
-    # 500 ISM steps followed by 500 SDEdit reconstruction steps.
+    # 500 first-guidance (ISM or UVD-SFD) steps followed by 500 SDEdit steps.
     max_steps: 1000
     # Reference train_mouth.py uses 3 pose/view samples per ISM optimizer step
     # but exactly 1 sample per SDEdit step.
@@ -177,9 +177,9 @@ system:
   regional_guidance:
     enabled: false
 
-  # Canonical correspondence used only by UVD-consistent ISM.  The historical
-  # CLI label is --guidance-mode uvd-sfd; both modes otherwise use the same
-  # AnimPortrait3D inversion target, schedule, weights, and optimizer.
+  # Canonical correspondence used only by UVD-SFD.  One CFD/UVD noise draw
+  # directly constructs both x_t and x_s; guidance subtracts the null-prompt
+  # score at s from the text-guided score at t without DDIM inversion.
   uvd_surface_flow:
     alpha_threshold: 0.05
     contribution_threshold: 0.01
@@ -243,7 +243,7 @@ system:
       opacity_floor: 0.03
       require_runtime_activity: true
 
-  # Capture the exact 500-step ISM/UVD-consistent-ISM result before SDEdit
+  # Capture the exact 500-step ISM/UVD-SFD result before SDEdit
   # update. Outputs are mouth_ism.* (or mouth_uvd_sfd.*) plus a complete
   # *_driving_test frame directory and MP4.
   first_phase_artifacts:

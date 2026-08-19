@@ -1,4 +1,4 @@
-# UVD-consistent ISM
+# UVD-SFD: CFD-consistent noise + ISM-style score difference
 
 The first refinement phase exposes one ablation switch:
 
@@ -7,26 +7,30 @@ The first refinement phase exposes one ablation switch:
 ```
 
 `ism` is the original AnimPortrait3D null-prompt DDIM-inversion objective.
-`uvd-sfd` is retained as the historical experiment/output label, but now
-means **UVD-consistent ISM**. Both modes use the same timestep schedule,
-ControlNet/UNet predictions, CFG scale, ISM weight, regional weights,
-optimizer, and densification. The only algorithmic difference is the Gaussian
-noise supplied to the same ISM function.
+`uvd-sfd` is the CFD-consistent alternative. It keeps the same sampled
+timestep and the same annealed interval schedule as the ISM ablation, but it
+does not run DDIM inversion. Instead, the canonical UVD/CFD noise draw is used
+directly at both endpoints of the interval.
 
 ## Objective
 
-For both modes the gradient is
+For UVD-SFD, one canonical noise tensor `xi` constructs both noisy latents:
 
 ```text
-sqrt((1 - alpha_t) / alpha_t) * (epsilon_cfg(x_t, text) - epsilon_inv)
+x_t = alpha_t * x + sigma_t * xi
+x_s = alpha_s * x + sigma_s * xi
+
+g = epsilon_cfg(x_t, t, text) - epsilon(x_s, s, null)
 ```
 
-where `epsilon_inv` is obtained by the AnimPortrait3D null-prompt DDIM
-inversion. The removed implementation instead used
-`epsilon_cfg - epsilon_uvd`; that was a probability-flow update rather than
-ISM and is no longer present.
+Here `scheduler.add_noise` supplies the scheduler's `alpha`/`sigma`
+coefficients. The text endpoint uses the existing negative-prompt CFG rule;
+the lower-noise endpoint uses the null embedding. No ISM SNR weight and no
+model-predicted DDIM jump are applied to this UVD-SFD direction. The raw `ism`
+mode remains unchanged and still uses its weighted null-prompt DDIM-inversion
+target.
 
-Raw ISM draws ordinary iid noise. UVD-consistent ISM draws a fresh semantic
+UVD-SFD draws a fresh semantic
 `(layer, u, v, d)` Gaussian volume once per optimizer step. Full-image,
 regional-crop, multi-view, and gradient-accumulation calls in that optimizer
 step reuse the volume, so observations of the same animated surface share a
@@ -37,18 +41,19 @@ Each latent footprint deduplicates its canonical cells and combines them with
 `1/sqrt(N)` normalization. Under-resolved footprints blend the canonical
 component with independent fallback noise using square-root weights. This
 keeps unit marginal variance. Correspondence reliability affects only this
-coupling; it never multiplies or clips the final ISM gradient.
+coupling; it never multiplies or clips the final UVD-SFD gradient.
 
 The UVD mode deliberately has no private CFG scale, timestep schedule,
 gradient clipping, learning-rate multiplier, color projection, reference
-penalty, topology freeze, or SDEdit optimizer reset. This makes the guidance
-ablation attributable to canonical noise coupling.
+penalty, topology freeze, or SDEdit optimizer reset. Its two intentional
+changes relative to raw ISM are the CFD-consistent endpoint construction and
+the direct conditional-minus-null score difference.
 
-UVD mode requires `ism_variant: animportrait3d`; a custom config cannot
-silently fall back to the older interval objective. Checkpoints store both the
-guidance-method signature and the canonical noise/private-RNG state. Resuming
-with the other guidance mode, changed atlas settings, or a missing UVD noise
-state is rejected.
+UVD mode requires `ism_variant: animportrait3d` so it reuses the reference
+interval schedule and prompt layout. Checkpoints store the score-difference
+objective version as well as the canonical noise/private-RNG state. Resuming
+an older UVD objective, the other guidance mode, changed atlas settings, or a
+missing UVD noise state is rejected.
 
 ## Orthogonal SDEdit ablation
 
@@ -83,16 +88,17 @@ First-phase smoke tests (no SDEdit):
 
 ```powershell
 python train_mouth.py --reconstruction <stage1_dir> --guidance-mode ism --sdedit-mode independent --max-steps 10 --output outputs/smoke/mouth_ism --gpu 0
-python train_mouth.py --reconstruction <stage1_dir> --guidance-mode uvd-sfd --sdedit-mode independent --max-steps 10 --output outputs/smoke/mouth_uvd_ism --gpu 0
+python train_mouth.py --reconstruction <stage1_dir> --guidance-mode uvd-sfd --sdedit-mode independent --max-steps 10 --output outputs/smoke/mouth_uvd_sfd --gpu 0
 ```
 
-Production mouth and full UVD-consistent runs:
+Production mouth and full UVD-SFD runs:
 
 ```powershell
 python train_mouth.py --reconstruction <stage1_dir> --guidance-mode uvd-sfd --sdedit-mode flame-surface --surface-views 4 --gpu 0
 python train_full.py --reconstruction <stage1_dir> --guidance-mode uvd-sfd --sdedit-mode flame-surface --surface-views 4 --prompt "<identity-specific prompt>" --gpu 0
 ```
 
-Use a fresh output directory for every run. Old probability-flow UVD-SFD
-checkpoints are intentionally rejected; restart from their verified PLY if it
-is still useful as an initialization.
+Use a fresh output directory for every run. Checkpoints from the former
+UVD-consistent-DDIM-inversion objective are intentionally rejected by the new
+objective signature; restart from a verified PLY if it is still useful as an
+initialization.

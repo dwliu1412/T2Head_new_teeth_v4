@@ -229,8 +229,8 @@ def parse_args() -> argparse.Namespace:
         choices=GUIDANCE_MODES,
         default="ism",
         help=(
-            "First phase: original AnimPortrait3D ISM or UVD-consistent "
-            "ISM (historical label 'uvd-sfd')"
+            "First phase: original AnimPortrait3D ISM or CFD-consistent "
+            "UVD-SFD"
         ),
     )
     parser.add_argument(
@@ -273,8 +273,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         default=None,
         help=(
-            "Override first-phase optimizer steps that trigger UVD "
-            "densification in either guidance mode"
+            "Enable UVD densification and set the first-phase optimizer "
+            "steps that trigger it"
         ),
     )
     parser.add_argument(
@@ -482,10 +482,13 @@ def main() -> None:
     if args.densification_steps is not None:
         if any(step <= 0 for step in args.densification_steps):
             raise ValueError("--densification-steps must be positive")
-        overrides.append(
-            "system.densification.steps=["
-            + ",".join(str(step) for step in args.densification_steps)
-            + "]"
+        overrides.extend(
+            [
+                omega_override("system.densification.enabled", True),
+                "system.densification.steps=["
+                + ",".join(str(step) for step in args.densification_steps)
+                + "]",
+            ]
         )
     if args.max_gaussians is not None:
         if args.max_gaussians <= 0:

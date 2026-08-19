@@ -14,6 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 GUIDANCE_MODES = ("ism", "uvd-sfd")
 SDEDIT_MODES = ("independent", "flame-surface")
 DEFAULT_SURFACE_SDEDIT_VIEWS = 4
+FACE_LOCAL_SCALE_ROTATION_COMMENT = (
+    "comment scale_rotation_space=flame_face_local_v1"
+)
 
 
 def resolve_path(value: str | Path) -> Path:
@@ -45,6 +48,23 @@ def require_stage1(reconstruction_dir: Path) -> None:
             "Incomplete Stage-1 reconstruction; missing: "
             + ", ".join(str(path) for path in missing)
         )
+    uvd_path = reconstruction_dir / "model" / "uvd.ply"
+    with uvd_path.open("rb") as stream:
+        header_lines = []
+        for _ in range(512):
+            line = stream.readline()
+            if not line:
+                break
+            decoded = line.decode("ascii", errors="replace").strip()
+            header_lines.append(decoded)
+            if decoded == "end_header":
+                break
+    if FACE_LOCAL_SCALE_ROTATION_COMMENT not in header_lines:
+        raise ValueError(
+            "Stage-1 uvd.ply uses the legacy UVD covariance representation. "
+            "Rerun reconstruction, or convert it with "
+            "tools/convert_legacy_uvd_ply.py before train_mouth."
+        )
 
 
 def output_overrides(output_dir: Path) -> list[str]:
@@ -63,7 +83,7 @@ def guidance_mode_overrides(
     *,
     uvd_flow_seed: int = 0,
 ) -> list[str]:
-    """Select raw ISM or UVD-consistent ISM for a clean ablation."""
+    """Select raw ISM or CFD-consistent UVD-SFD."""
 
     mode = str(mode).strip().lower()
     if mode not in GUIDANCE_MODES:
@@ -72,7 +92,7 @@ def guidance_mode_overrides(
         )
     seed = int(uvd_flow_seed)
     if seed < 0:
-        raise ValueError("UVD-ISM noise seed must be non-negative")
+        raise ValueError("UVD-SFD noise seed must be non-negative")
     return [
         omega_override("system.guidance.use_ism", mode == "ism"),
         omega_override(
@@ -90,7 +110,7 @@ def sdedit_mode_overrides(
     """Select the independent or joint FLAME-surface SDEdit branch.
 
     The switch is deliberately orthogonal to :func:`guidance_mode_overrides`:
-    ISM/UVD-consistent ISM controls the first optimization phase, while this
+    ISM/UVD-SFD controls the first optimization phase, while this
     function
     changes only the subsequent img2img teacher.  The independent branch does
     not override ``data.batch_size`` and therefore preserves legacy configs.

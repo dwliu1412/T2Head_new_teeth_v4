@@ -32,7 +32,6 @@ import threestudio
 from gaussiansplatting.arguments import PipelineParams
 from gaussiansplatting.gaussian_renderer import render
 from gaussiansplatting.scene.gaussian_flame_face import GaussianFlameUVModel
-from gaussiansplatting.utils.general_utils import strip_symmetric
 from gaussiansplatting.utils.sh_utils import RGB2SH, SH2RGB
 from surface_inpaint.layered_surface import (
     LayerSurfaceBuffers,
@@ -40,9 +39,14 @@ from surface_inpaint.layered_surface import (
     compose_layered_surface,
     normalize_alpha_weighted,
 )
-from surface_inpaint.stability import stabilize_uvd_covariances
+from surface_inpaint.stability import stabilize_face_local_covariances
 from threestudio.systems.base import BaseLift3DSystem
-from train_reconstruction import OpenCVCamera, aligned_geometry, save_world_ply
+from train_reconstruction import (
+    OpenCVCamera,
+    apply_similarity_to_gaussians,
+    aligned_scaling_rotation,
+    save_world_ply,
+)
 
 
 @threestudio.register("head-3dgs-reconstruction-finetune-system")
@@ -88,17 +92,16 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         # legitimate hair/clothing Gaussians in the reconstruction.
         max_world_scale: float = 0.16
         world_scale_weight: float = 0.01
-        # AnimPortrait3D applies a very strong visible-Gaussian scale penalty
-        # in both ISM and SDEdit.  UVD transport additionally needs a hard
-        # world-space guard because a benign canonical scale can be stretched
-        # by a sampled FLAME-pose Jacobian.
+        # Full-stage stability is evaluated on aligned world-space axes. This
+        # block configures the hard render guard plus per-point growth and
+        # anisotropy envelopes; face-local scales have no shared threshold.
         scale_stability: dict = field(default_factory=dict)
 
         optimization: dict = field(default_factory=dict)
         proximal: dict = field(default_factory=dict)
         mouth: dict = field(default_factory=dict)
         # One-time pose-envelope repair plus a small in-training hard cap for
-        # UVD covariances whose world scale explodes when the jaw opens.
+        # face-local ellipsoid outliers under the animated face scale.
         geometry_stability: dict = field(default_factory=dict)
         mouth_guidance_regions: list[str] = field(
             default_factory=lambda: ["lips", "teeth", "oral_cavity"]
@@ -192,33 +195,95 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             raise ValueError(
                 "guidance_reference_dilation must be non-negative"
             )
+        if float(self.cfg.max_world_scale) <= 0.0:
+            raise ValueError("max_world_scale must be positive")
+        if float(self.cfg.world_scale_weight) < 0.0:
+            raise ValueError("world_scale_weight must be non-negative")
         scale_stability = self.cfg.scale_stability
         if bool(scale_stability.get("enabled", False)):
-            threshold = float(scale_stability.get("threshold", 0.2))
-            hard_canonical = float(
-                scale_stability.get("hard_max_canonical_scale", 0.25)
-            )
             hard_world = float(
                 scale_stability.get(
                     "hard_max_world_scale", self.cfg.max_world_scale
                 )
             )
-            if threshold <= 0.0 or hard_canonical <= 0.0 or hard_world <= 0.0:
+            if hard_world <= 0.0:
                 raise ValueError(
-                    "scale_stability thresholds must all be positive"
+                    "scale_stability.hard_max_world_scale must be positive"
                 )
-            if hard_canonical < threshold:
-                raise ValueError(
-                    "scale_stability.hard_max_canonical_scale must be at "
-                    "least scale_stability.threshold"
-                )
-            for key in ("ism_weight", "sdedit_weight"):
-                if float(scale_stability.get(key, 0.0)) < 0.0:
+            for weight_name in (
+                "world_anisotropy_weight",
+                "reference_growth_weight",
+                "reference_anisotropy_weight",
+            ):
+                if float(scale_stability.get(weight_name, 0.0)) < 0.0:
                     raise ValueError(
-                        f"scale_stability.{key} must be non-negative"
+                        f"scale_stability.{weight_name} must be non-negative"
                     )
+            for limit_name, weight_name in (
+                ("reference_growth_limit", "reference_growth_weight"),
+                (
+                    "reference_anisotropy_growth_limit",
+                    "reference_anisotropy_weight",
+                ),
+            ):
+                if (
+                    float(scale_stability.get(weight_name, 0.0)) > 0.0
+                    and float(scale_stability.get(limit_name, 1.0)) < 1.0
+                ):
+                    raise ValueError(
+                        f"scale_stability.{limit_name} must be at least 1"
+                    )
+            absolute_anisotropy = scale_stability.get(
+                "max_world_anisotropy"
+            )
+            if absolute_anisotropy is not None and (
+                not math.isfinite(float(absolute_anisotropy))
+                or float(absolute_anisotropy) < 1.0
+            ):
+                raise ValueError(
+                    "scale_stability.max_world_anisotropy must be finite and "
+                    "at least 1"
+                )
         if not isinstance(self.cfg.full_protection, Mapping):
             raise ValueError("full_protection must be a mapping")
+        mouth_preservation = self.cfg.full_protection.get(
+            "mouth_screen_preservation", {}
+        )
+        if not isinstance(mouth_preservation, Mapping):
+            raise ValueError(
+                "full_protection.mouth_screen_preservation must be a mapping"
+            )
+        if bool(mouth_preservation.get("enabled", False)):
+            if not bool(self.cfg.full_protection.get("enabled", False)):
+                raise ValueError(
+                    "mouth screen preservation requires full_protection.enabled"
+                )
+            if not bool(self.cfg.full_protection.get("freeze_mouth", False)):
+                raise ValueError(
+                    "mouth screen preservation requires freeze_mouth=true"
+                )
+            if int(mouth_preservation.get("dilation", 0)) < 0:
+                raise ValueError(
+                    "mouth_screen_preservation.dilation must be non-negative"
+                )
+            for weight_name in (
+                "rgb_weight",
+                "alpha_weight",
+                "depth_weight",
+            ):
+                if float(mouth_preservation.get(weight_name, 0.0)) < 0.0:
+                    raise ValueError(
+                        "mouth_screen_preservation."
+                        f"{weight_name} must be non-negative"
+                    )
+            alpha_threshold = float(
+                mouth_preservation.get("alpha_threshold", 0.05)
+            )
+            if not 0.0 < alpha_threshold < 1.0:
+                raise ValueError(
+                    "mouth_screen_preservation.alpha_threshold must be in "
+                    "(0, 1)"
+                )
         self.uvd_flow_enabled = bool(
             self.cfg.guidance.get("use_uvd_surface_flow", False)
         )
@@ -230,7 +295,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             )
             if configured_layers != len(SURFACE_LAYER_NAMES):
                 raise ValueError(
-                    "UVD-consistent ISM requires exactly the five semantic layers "
+                    "UVD-SFD requires exactly the five semantic layers "
                     f"{SURFACE_LAYER_NAMES}, got {configured_layers}"
                 )
             surface_flow = self.cfg.uvd_surface_flow
@@ -675,6 +740,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         self._initial_reference_state["face_idx"] = (
             self.gaussian._face_idx.detach().clone()
         )
+        self._initial_reference_state["scale_trainable_mask"] = (
+            self._active_trainable_point_mask().detach().clone()
+        )
         self.register_buffer("reference_baseline", torch.tensor(float("nan"), device=device))
         self.register_buffer("reference_baseline_count", torch.tensor(0, dtype=torch.long, device=device))
         self.register_buffer("reference_dual", torch.tensor(float(self.cfg.reference_weight), device=device))
@@ -826,7 +894,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             upper += padding
         if not math.isfinite(lower) or not math.isfinite(upper) or upper <= lower:
             raise ValueError(
-                "UVD-ISM canonical d range must contain two increasing finite values"
+                "UVD-SFD canonical d range must contain two increasing finite values"
             )
         self.uvd_flow_d_range = torch.tensor(
             (lower, upper),
@@ -834,7 +902,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             device=self.gaussian.device,
         )
         threestudio.info(
-            f"[UVD-ISM] Fixed canonical d range [{lower:.6g}, {upper:.6g}]"
+            f"[UVD-SFD] Fixed canonical d range [{lower:.6g}, {upper:.6g}]"
         )
 
     def _canonical_surface_masks(
@@ -896,11 +964,11 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         return masks
 
     def _uvd_flow_surface_masks(self) -> dict[str, torch.Tensor]:
-        """Return the UVD-ISM semantic surface partition."""
+        """Return the UVD-SFD semantic surface partition."""
 
         if not self.uvd_flow_enabled:
             raise RuntimeError(
-                "UVD surface layers requested while UVD-ISM is disabled"
+                "UVD surface layers requested while UVD-SFD is disabled"
             )
         return self._canonical_surface_masks()
 
@@ -1082,7 +1150,10 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 pass_updates = 0
                 for _, pose in named_poses:
                     self._set_pose(*pose)
-                    world_scale = self.gaussian.get_world_scale()[:, 0]
+                    world_scale = (
+                        self.gaussian.get_world_scale()[:, 0]
+                        * self._scene_similarity_scale()
+                    )
                     if pass_index == 0 and bool(mask.any().item()):
                         before_max = max(
                             before_max,
@@ -1112,7 +1183,10 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             after_max = 0.0
             for _, pose in named_poses:
                 self._set_pose(*pose)
-                scale = self.gaussian.get_world_scale()[:, 0]
+                scale = (
+                    self.gaussian.get_world_scale()[:, 0]
+                    * self._scene_similarity_scale()
+                )
                 if bool(mask.any().item()):
                     after_max = max(after_max, float(scale[mask].max().item()))
         finally:
@@ -1138,12 +1212,13 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             return {"enabled": False}
         named_poses, reference = self._stability_pose_envelope()
         global_cfg = cfg.get("global", {})
-        global_report = stabilize_uvd_covariances(
+        global_report = stabilize_face_local_covariances(
             self.gaussian,
             named_poses,
             lambda pose: self._set_pose(*pose),
             global_cfg,
             reference_pose=reference,
+            world_scale_multiplier=self._scene_similarity_scale(),
         )
         dental_report = self._cap_region_over_pose_envelope(
             self.dental_point_mask,
@@ -1186,6 +1261,12 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         self.gaussian._neck_pose = zeros
         self.gaussian._translation = zeros
 
+    def _scene_similarity_scale(self) -> float:
+        """Uniform FLAME-to-camera-scene scale from the saved alignment."""
+
+        linear = self.alignment[:3, :3]
+        return float(linear.square().sum().div(3.0).sqrt().item())
+
     def _set_reference_pose(self) -> None:
         self._set_pose(self.reference_expression, self.reference_jaw, self.reference_leye, self.reference_reye)
 
@@ -1200,13 +1281,100 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             self._parameter(batch["reye_pose"], 3, device),
         )
 
-    def _aligned_geometry(
+    def _aligned_render_geometry(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # SVD-stabilized UVD Jacobians and covariance transport must remain
-        # FP32 under Lightning mixed precision.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pose FLAME, then produce final-scene scale/rotation for rendering."""
+
         with torch.cuda.amp.autocast(enabled=False):
-            return aligned_geometry(self.gaussian, self.alignment)
+            return aligned_scaling_rotation(self.gaussian, self.alignment)
+
+    @torch.no_grad()
+    def _reference_world_scales_current_pose(
+        self, current_world_scales: torch.Tensor
+    ) -> torch.Tensor:
+        """Recover incoming-avatar world axes under the current FLAME pose.
+
+        Face deformation and scene alignment multiply current and initial
+        local axes by the same factors. Replacing the detached current local
+        scale with the immutable incoming scale therefore gives the exact
+        same-pose world reference without evaluating FLAME a second time.
+        """
+
+        if self.initial["scale"].shape != self.gaussian._scaling.shape:
+            raise RuntimeError(
+                "World-scale reference topology differs from the Gaussian model"
+            )
+        current_local = self.gaussian.scaling_activation(
+            self.gaussian._scaling.detach()
+        ).clamp_min(1.0e-12)
+        reference_local = self.gaussian.scaling_activation(
+            self.initial["scale"]
+        ).clamp_min(1.0e-12)
+        return current_world_scales.detach() * (
+            reference_local / current_local
+        )
+
+    def _full_world_scale_axis_ratio(
+        self,
+        scales: torch.Tensor,
+        trainable_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return per-axis shrink ratios for absolute world-space guards."""
+
+        maximum = float(
+            self.cfg.scale_stability.get(
+                "hard_max_world_scale", self.cfg.max_world_scale
+            )
+        )
+        finite_scales = torch.nan_to_num(
+            scales,
+            nan=maximum * 2.0,
+            posinf=maximum * 2.0,
+            neginf=0.0,
+        )
+        ratio = (
+            maximum / finite_scales.clamp_min(1.0e-12)
+        ).clamp(max=1.0)
+        maximum_anisotropy = self.cfg.scale_stability.get(
+            "max_world_anisotropy"
+        )
+        if maximum_anisotropy is not None:
+            # Shrink long axes instead of inflating thin axes. This removes
+            # needle support without making a splat thicker or more opaque.
+            shortest = finite_scales.detach().amin(dim=-1, keepdim=True)
+            anisotropy_ratio = (
+                shortest
+                * float(maximum_anisotropy)
+                / finite_scales.clamp_min(1.0e-12)
+            ).clamp(max=1.0)
+            ratio = torch.minimum(ratio, anisotropy_ratio)
+        if self._full_region_protection_enabled():
+            if trainable_mask is None:
+                trainable_mask = self._active_trainable_point_mask()
+            trainable = torch.as_tensor(
+                trainable_mask,
+                device=scales.device, dtype=torch.bool
+            ).reshape(-1)
+            if trainable.shape[0] != scales.shape[0]:
+                raise ValueError(
+                    "Full scale-guard mask topology does not match the "
+                    f"rendered Gaussian topology: mask={trainable.shape[0]}, "
+                    f"scales={scales.shape[0]}"
+                )
+            ratio = torch.where(
+                trainable[:, None], ratio, torch.ones_like(ratio)
+            )
+        return ratio
+
+    def _cap_full_render_world_scales(
+        self, scales: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply non-mutating axis and anisotropy guards in every FLAME pose."""
+
+        if not self._full_scale_stability_enabled():
+            return scales
+        return scales * self._full_world_scale_axis_ratio(scales)
 
     def _cameras(
         self, batch: Mapping[str, Any]
@@ -1447,8 +1615,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         background = (self.background if background is None else background.to(self.gaussian.device).float())
         with torch.cuda.amp.autocast(enabled=False):
             cameras = self._cameras(batch)
-            means, covariance = self._aligned_geometry()
-            packed = (means, strip_symmetric(covariance))
+            means, scales, rotations = self._aligned_render_geometry()
+            scales = self._cap_full_render_world_scales(scales)
+            packed = (means, scales, rotations)
 
         images, raw_images, alphas, depths = [], [], [], []
         viewspace_points, visibility_filters, radii = [], [], []
@@ -1470,7 +1639,8 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             "alpha": torch.stack(alphas),
             "depth": torch.stack(depths),
             "means": means,
-            "covariance": covariance,
+            "scales": scales,
+            "rotations": rotations,
             "viewspace_points": viewspace_points,
             "visibility_filter": visibility_filters,
             "radii": radii,
@@ -1492,7 +1662,8 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             raise ValueError("Semantic point mask has the wrong topology")
         packed = (
             output["means"].detach(),
-            strip_symmetric(output["covariance"].detach()),
+            output["scales"].detach(),
+            output["rotations"].detach(),
         )
         opacity = self.gaussian.get_opacity.detach() * point_mask[:, None]
         masks = []
@@ -1571,7 +1742,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         """Return the immutable calibrated foreground in render resolution."""
 
         if self._uses_continuous_camera(batch):
-            _, continuous_alpha = self._render_initial_continuous_reference(
+            _, continuous_alpha, _ = self._render_initial_continuous_reference(
                 batch, reference_pose=False
             )
             alpha = self._bchw(
@@ -1994,7 +2165,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         return signature
 
     def _guidance_method_signature(self) -> dict[str, Any]:
-        """Return the ISM ablation identity saved in every checkpoint."""
+        """Return the first-phase guidance identity saved in checkpoints."""
 
         if not self.uvd_flow_enabled:
             return {"mode": "ism"}
@@ -2008,6 +2179,14 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         )
         return {
             "mode": "uvd-sfd",
+            "objective": {
+                "name": "cfd-consistent-score-difference",
+                "version": 1,
+                "t_score": "negative-prompt-cfg",
+                "s_score": "null-prompt",
+                "weighting": "none",
+                "interval": "animportrait3d-annealed-100-to-50",
+            },
             "noise": {
                 "seed": int(guidance.get("uvd_flow_noise_seed", 0)),
                 "uv_resolution": int(
@@ -2092,7 +2271,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
     def _validate_guidance_checkpoint_method(
         self, checkpoint: Mapping[str, Any]
     ) -> None:
-        """Reject a resume that mixes raw and UVD-consistent ISM."""
+        """Reject a resume that mixes first-phase guidance objectives."""
 
         saved_method = checkpoint.get("stage2_guidance_method")
         current_method = self._guidance_method_signature()
@@ -2124,7 +2303,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             saved_global_step = checkpoint.get("global_step")
             if saved_global_step is None or int(saved_global_step) > 0:
                 raise ValueError(
-                    "UVD-consistent ISM checkpoint is missing its canonical "
+                    "UVD-SFD checkpoint is missing its canonical "
                     "noise/RNG state and cannot be resumed exactly"
                 )
 
@@ -2205,14 +2384,12 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
     def _capture_sdedit_reference(self) -> None:
         """Freeze the first-phase result used as every later img2img source."""
 
-        # Never freeze an out-of-bounds first-phase state as the teacher for all 750
-        # SDEdit steps.  This also repairs legacy step-1000 checkpoints before
-        # their first SDEdit source is captured.
+        # Never freeze an out-of-bounds first-phase state as the teacher for
+        # all 750 SDEdit steps.  The optional repair is world-space only.
         scale_report = self._stabilize_current_full_scale()
-        if scale_report["canonical_capped"] or scale_report["world_capped"]:
+        if scale_report["world_capped"]:
             threestudio.info(
                 "Sanitized the SDEdit boundary geometry before capture: "
-                f"canonical={scale_report['canonical_capped']}, "
                 f"world={scale_report['world_capped']}."
             )
         self._sdedit_reference_state = {
@@ -2223,6 +2400,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             "opacity": self.gaussian._opacity.detach().clone(),
             "scale": self.gaussian._scaling.detach().clone(),
             "rotation": self.gaussian._rotation.detach().clone(),
+            "scale_trainable_mask": (
+                self._active_trainable_point_mask().detach().clone()
+            ),
         }
         threestudio.info(
             "Captured fixed SDEdit source at optimization step "
@@ -2235,7 +2415,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         state: Mapping[str, torch.Tensor],
         batch: Mapping[str, Any],
         reference_pose: bool = False,
-    ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Map one immutable Gaussian state into the sampled live pose."""
 
         if reference_pose:
@@ -2253,49 +2433,28 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 normals,
                 face_idx=face_idx,
             )
-            jacobian = self.gaussian._uvd_jacobian(
+            scales, rotations = self.gaussian._deformed_scaling_rotation(
                 vertices,
-                normals,
                 face_idx=face_idx,
-                uv=uv,
-                d=distance,
+                local_scaling=self.gaussian.scaling_activation(
+                    state["scale"]
+                ),
+                local_rotation=state["rotation"],
             )
-            covariance = self.gaussian._world_covariance_matrix(
-                jacobian,
-                self.gaussian.scaling_activation(state["scale"]),
-                state["rotation"],
+            means, scales, rotations = apply_similarity_to_gaussians(
+                means, scales, rotations, self.alignment
             )
-            linear = self.alignment[:3, :3]
-            translation = self.alignment[:3, 3]
-            means = means @ linear.T + translation
-            covariance = linear[None] @ covariance @ linear.T[None]
             if self._full_scale_stability_enabled():
                 # The frozen first-phase source is rendered under many later poses.
-                # Bound its covariance per pose without mutating the snapshot,
-                # otherwise a safe boundary pose can still become a needle in
-                # a different expression during SDEdit target generation.
-                maximum = float(
-                    self.cfg.scale_stability.get(
-                        "hard_max_world_scale", self.cfg.max_world_scale
-                    )
+                # Bound both explicit axes and absolute anisotropy per pose
+                # without mutating the snapshot.  A frozen source can retain
+                # the pre-densification topology, so its region-protection
+                # mask must come from the same snapshot rather than the live
+                # Gaussian model.
+                scales = scales * self._full_world_scale_axis_ratio(
+                    scales, state.get("scale_trainable_mask")
                 )
-                source_world_scale = (
-                    torch.linalg.eigvalsh(covariance)
-                    .clamp_min(0.0)
-                    .sqrt()
-                    .amax(dim=-1)
-                )
-                source_world_scale = torch.nan_to_num(
-                    source_world_scale,
-                    nan=maximum * 2.0,
-                    posinf=maximum * 2.0,
-                    neginf=0.0,
-                )
-                source_ratio = (
-                    maximum / source_world_scale.clamp_min(1.0e-12)
-                ).clamp(max=1.0)
-                covariance = covariance * source_ratio.square()[:, None, None]
-            packed = (means, strip_symmetric(covariance))
+            packed = (means, scales, rotations)
             opacity = self.gaussian.opacity_activation(state["opacity"])
         return packed, opacity
 
@@ -2306,7 +2465,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         batch: Mapping[str, Any],
         background: torch.Tensor,
         reference_pose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Render an immutable Gaussian state in a sampled camera/pose."""
 
         packed, opacity = self._frozen_reference_geometry(
@@ -2315,7 +2474,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         color = SH2RGB(state["feature"][:, 0, :]).clamp(0.0, 1.0)
         cameras = self._cameras(batch)
 
-        images, alphas = [], []
+        images, alphas, depths = [], [], []
         for camera in cameras:
             with torch.cuda.amp.autocast(enabled=False):
                 package = render(
@@ -2333,7 +2492,12 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 .permute(1, 2, 0)
                 .clamp(0.0, 1.0)
             )
-        return torch.stack(images).detach(), torch.stack(alphas).detach()
+            depths.append(package["depth_3dgs"].permute(1, 2, 0))
+        return (
+            torch.stack(images).detach(),
+            torch.stack(alphas).detach(),
+            torch.stack(depths).detach(),
+        )
 
     @staticmethod
     def _uses_continuous_camera(batch: Mapping[str, Any]) -> bool:
@@ -2347,7 +2511,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         self,
         batch: Mapping[str, Any],
         reference_pose: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return same-camera targets for continuous training views."""
 
         if not self._uses_continuous_camera(batch):
@@ -2371,6 +2535,26 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         return rendered
 
     @torch.no_grad()
+    def _render_initial_dynamic_reference(
+        self, batch: Mapping[str, Any]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Render the incoming full-stage avatar in the sampled live pose."""
+
+        cache_key = "_initial_dynamic_pose_cache"
+        cached = batch.get(cache_key)
+        if cached is not None:
+            return cached
+        rendered = self._render_frozen_reference_state(
+            self._initial_reference_state,
+            batch,
+            torch.ones(3, device=self.gaussian.device),
+            reference_pose=False,
+        )
+        if isinstance(batch, dict):
+            batch[cache_key] = rendered
+        return rendered
+
+    @torch.no_grad()
     def _render_sdedit_reference(
         self,
         batch: Mapping[str, Any],
@@ -2382,7 +2566,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             self._capture_sdedit_reference()
         state = self._sdedit_reference_state
         assert state is not None
-        image, _ = self._render_frozen_reference_state(
+        image, _, _ = self._render_frozen_reference_state(
             state, batch, background, reference_pose=False
         )
         return image
@@ -2552,7 +2736,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
 
         required = ("surface_uvd", "surface_layer", "surface_confidence")
         if any(name not in surface for name in required):
-            raise ValueError("UVD-ISM surface correspondence is incomplete")
+            raise ValueError("UVD-SFD surface correspondence is incomplete")
         uvd = surface["surface_uvd"]
         layer = surface["surface_layer"]
         confidence = surface["surface_confidence"]
@@ -2563,7 +2747,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             or confidence.shape != layer.shape
         ):
             raise ValueError(
-                "UVD-ISM correspondence must be UVD Bx3xHxW plus layer/"
+                "UVD-SFD correspondence must be UVD Bx3xHxW plus layer/"
                 "confidence Bx1xHxW"
             )
         indices = torch.as_tensor(
@@ -2574,7 +2758,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         )
         if crop_boxes.shape != (indices.numel(), 4):
             raise ValueError(
-                "UVD-ISM crop plan must contain one box per selected view"
+                "UVD-SFD crop plan must contain one box per selected view"
             )
         resolution = 512
         uvd_crops, layer_crops, confidence_crops = [], [], []
@@ -2582,7 +2766,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         for index, box in zip(indices.tolist(), crop_boxes.tolist()):
             x0, y0, x1, y1 = (int(value) for value in box)
             if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
-                raise ValueError("UVD-ISM crop plan is outside the render")
+                raise ValueError("UVD-SFD crop plan is outside the render")
             slices = (slice(index, index + 1), slice(None), slice(y0, y1), slice(x0, x1))
             # Coordinates and semantic ids are categorical surface samples;
             # nearest resize never interpolates across a UV seam or between
@@ -3364,7 +3548,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             or contribution.shape[0] < 2
         ):
             raise ValueError(
-                "UVD-ISM layer statistics must share shape LxHxW with L>=2"
+                "UVD-SFD layer statistics must share shape LxHxW with L>=2"
             )
         visible_candidate = (
             (alpha >= alpha_threshold)
@@ -3581,7 +3765,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         """
 
         if self.uvd_flow_d_range is None:
-            raise RuntimeError("UVD-ISM has no fixed canonical d range")
+            raise RuntimeError("UVD-SFD has no fixed canonical d range")
         masks = self._uvd_flow_surface_masks()
         lower, upper = self.uvd_flow_d_range.unbind()
         canonical_d = self.gaussian._d.detach().float().reshape(
@@ -3596,7 +3780,8 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         )
         packed = (
             output["means"].detach(),
-            strip_symmetric(output["covariance"].detach()),
+            output["scales"].detach(),
+            output["rotations"].detach(),
         )
         scene_opacity = self.gaussian.get_opacity.detach().float()
         opacity_floor = float(
@@ -3786,7 +3971,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             reference_pose=True,
         )
         if self._uses_continuous_camera(batch):
-            target_rgb_hwc, target_alpha_hwc = (
+            target_rgb_hwc, target_alpha_hwc, _ = (
                 self._render_initial_continuous_reference(
                     batch, reference_pose=True
                 )
@@ -3819,6 +4004,89 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         alpha_loss = F.smooth_l1_loss(alpha_prediction, alpha_target)
         total = rgb_loss + float(self.cfg.reference_alpha_weight) * alpha_loss
         return total, rgb_loss, alpha_loss
+
+    @staticmethod
+    def _masked_smooth_l1(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if prediction.shape != target.shape:
+            raise ValueError("Masked loss prediction and target shapes differ")
+        if mask.shape[:-1] != prediction.shape[:-1] or mask.shape[-1] != 1:
+            raise ValueError("Masked loss expects a matching BxHxWx1 mask")
+        error = F.smooth_l1_loss(prediction, target, reduction="none")
+        weight = mask.to(device=error.device, dtype=error.dtype).expand_as(error)
+        return (error * weight).sum() / weight.sum().clamp_min(1.0)
+
+    def _mouth_screen_preservation_loss(
+        self,
+        batch: Mapping[str, Any],
+        output: Mapping[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Keep trainable splats from changing or occluding the frozen mouth."""
+
+        zero = output["alpha"].sum() * 0.0
+        config = self.cfg.full_protection.get(
+            "mouth_screen_preservation", {}
+        )
+        if not (
+            self._full_region_protection_enabled()
+            and bool(config.get("enabled", False))
+        ):
+            return zero, {}
+
+        target_rgb, target_alpha, target_depth = (
+            self._render_initial_dynamic_reference(batch)
+        )
+        mouth_mask = self._render_point_mask(
+            batch, output, self.mouth_guidance_point_mask
+        )
+        mouth_mask = self._dilate_mask(
+            mouth_mask, int(config.get("dilation", 0))
+        ).detach()
+        alpha_threshold = float(config.get("alpha_threshold", 0.05))
+        support = mouth_mask * (target_alpha > alpha_threshold).to(
+            mouth_mask.dtype
+        )
+
+        rgb = self._masked_smooth_l1(
+            output.get("comp_rgb_raw", output["comp_rgb"]),
+            target_rgb,
+            support,
+        )
+        alpha = self._masked_smooth_l1(
+            output["alpha"], target_alpha, support
+        )
+
+        current_alpha = output["alpha"]
+        current_expected_depth = torch.where(
+            current_alpha > alpha_threshold,
+            output["depth"] / current_alpha.clamp_min(alpha_threshold),
+            torch.zeros_like(output["depth"]),
+        )
+        target_expected_depth = torch.where(
+            target_alpha > alpha_threshold,
+            target_depth / target_alpha.clamp_min(alpha_threshold),
+            torch.zeros_like(target_depth),
+        )
+        # Compare relative depth so the weight is independent of the global
+        # scene scale. A new splat in front of the lips/teeth changes this
+        # expected depth even when its RGB happens to look plausible.
+        depth_scale = target_expected_depth.abs().clamp_min(1.0e-3)
+        depth = self._masked_smooth_l1(
+            current_expected_depth / depth_scale,
+            target_expected_depth / depth_scale,
+            support,
+        )
+        parts = {
+            "mouth_screen_rgb": float(config.get("rgb_weight", 0.0)) * rgb,
+            "mouth_screen_alpha": float(config.get("alpha_weight", 0.0))
+            * alpha,
+            "mouth_screen_depth": float(config.get("depth_weight", 0.0))
+            * depth,
+        }
+        return sum(parts.values()), parts
 
     def _silhouette_spill_loss(
         self,
@@ -3899,43 +4167,86 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             active = excess > 0.0
             return excess.square().sum() / active.sum().clamp_min(1)
 
-        eigenvalues = torch.linalg.eigvalsh(output["covariance"]).clamp_min(0.0)
-        world_scale = eigenvalues.sqrt().amax(dim=-1)
-        global_barrier = violation_mean_square(
-            F.relu(world_scale - float(self.cfg.max_world_scale))
+        world_scales = output["scales"]
+        trainable_mask = None
+        if self._full_scale_stability_enabled():
+            trainable_mask = self._active_trainable_point_mask().to(
+                device=world_scales.device, dtype=torch.bool
+            )
+        barrier_scales = (
+            world_scales[trainable_mask]
+            if trainable_mask is not None
+            else world_scales
         )
+        if barrier_scales.numel():
+            world_scale = barrier_scales.amax(dim=-1)
+            global_barrier = violation_mean_square(
+                F.relu(world_scale - float(self.cfg.max_world_scale))
+            )
+        else:
+            global_barrier = world_scales.sum() * 0.0
         parts = {"world_scale": float(self.cfg.world_scale_weight) * global_barrier}
-        scale_stability = self.cfg.scale_stability
-        if (
-            self.optimization_stage == "full"
-            and bool(scale_stability.get("enabled", False))
-        ):
-            visible = torch.zeros(
-                self.gaussian.num_gs,
-                dtype=torch.bool,
-                device=self.gaussian.device,
+        if trainable_mask is not None and bool(trainable_mask.any().item()):
+            stability = self.cfg.scale_stability
+            current = world_scales[trainable_mask].clamp_min(1.0e-12)
+            reference = self._reference_world_scales_current_pose(
+                world_scales
+            )[trainable_mask].clamp_min(1.0e-12)
+            growth_weight = float(
+                stability.get("reference_growth_weight", 0.0)
             )
-            for view_visibility in output.get("visibility_filter", ()):
-                visible |= view_visibility.detach().to(
-                    device=self.gaussian.device, dtype=torch.bool
+            if growth_weight > 0.0:
+                growth_limit = float(
+                    stability.get("reference_growth_limit", 1.0)
                 )
-            canonical_scale = self.gaussian.get_scaling[visible]
-            threshold = float(scale_stability.get("threshold", 0.2))
-            phase_weight = float(
-                scale_stability.get(
-                    "sdedit_weight" if self._sdedit_active() else "ism_weight",
-                    0.0,
+                growth_excess = F.relu(
+                    torch.log(current / reference) - math.log(growth_limit)
                 )
+                parts["world_scale_growth"] = (
+                    growth_weight * violation_mean_square(growth_excess)
+                )
+            current_anisotropy = (
+                current.amax(dim=-1) / current.amin(dim=-1)
             )
-            if canonical_scale.numel():
-                # This is the exact non-metric scale loss used by
-                # AnimPortrait3D train_all.py: an L2 excess per visible
-                # Gaussian followed by a sum, not a mean.
-                canonical_excess = F.relu(canonical_scale - threshold)
-                canonical_barrier = canonical_excess.norm(dim=1).sum()
-            else:
-                canonical_barrier = self.gaussian._scaling.sum() * 0.0
-            parts["canonical_scale"] = phase_weight * canonical_barrier
+            absolute_anisotropy_weight = float(
+                stability.get("world_anisotropy_weight", 0.0)
+            )
+            maximum_anisotropy = stability.get(
+                "max_world_anisotropy"
+            )
+            if (
+                absolute_anisotropy_weight > 0.0
+                and maximum_anisotropy is not None
+            ):
+                absolute_excess = F.relu(
+                    torch.log(current_anisotropy)
+                    - math.log(float(maximum_anisotropy))
+                )
+                parts["world_anisotropy"] = (
+                    absolute_anisotropy_weight
+                    * violation_mean_square(absolute_excess)
+                )
+            anisotropy_weight = float(
+                stability.get("reference_anisotropy_weight", 0.0)
+            )
+            if anisotropy_weight > 0.0:
+                anisotropy_limit = float(
+                    stability.get(
+                        "reference_anisotropy_growth_limit", 1.0
+                    )
+                )
+                reference_anisotropy = (
+                    reference.amax(dim=-1) / reference.amin(dim=-1)
+                )
+                anisotropy_excess = F.relu(
+                    torch.log(current_anisotropy / reference_anisotropy)
+                    - math.log(anisotropy_limit)
+                )
+                parts["world_anisotropy_growth"] = (
+                    anisotropy_weight
+                    * violation_mean_square(anisotropy_excess)
+                )
+        world_scale = world_scales.amax(dim=-1)
         if bool(self.dental_point_mask.any().item()):
             mouth_scale = world_scale[self.dental_point_mask]
             mouth_d = self.gaussian._d[self.dental_point_mask, 0]
@@ -3975,7 +4286,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         )
         if self.surface_sdedit_enabled and not surface_joint_batch:
             # The data loader returns K cameras so the SDEdit phase can build
-            # one joint memory.  Keep the first ISM/UVD-ISM phase exactly
+            # one joint memory.  Keep the first ISM/UVD-SFD phase exactly
             # single-view; the random cyclic camera sampler makes this row an
             # unbiased draw from the selected elevation ring.
             batch = self._select_batch_views(
@@ -4003,10 +4314,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 "Every calibrated view in a refinement batch must share one pose"
             )
         self._active_open_mouth = bool(open_flags[0].item())
-        # Check every sampled expression/jaw pose before rendering it.  UVD
-        # covariance transport can be benign in canonical pose but explode
-        # under a large jaw Jacobian; a five-step post-hoc check left exactly
-        # the transient long splats seen in validation/training previews.
+        # Check every sampled expression/jaw pose before rendering it.  Any
+        # optional hard guard is evaluated in aligned world space; face-local
+        # scales are normalized by parent-face size and have no global limit.
         if (
             self.optimization_stage == "mouth"
             and bool(self.cfg.geometry_stability.get("enabled", False))
@@ -4019,21 +4329,13 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             )
         elif self._full_scale_stability_enabled():
             # Cap in the newly sampled pose before it is ever rasterized.  A
-            # cap only after optimizer.step() misses pose-Jacobian explosions
-            # on the next batch and still writes needle splats to previews.
+            # cap only after optimizer.step() still exposes an optimizer
+            # outlier to the next batch and writes it into previews.
             self._set_pose(*self._batch_pose(batch))
             scale_report = self._stabilize_current_full_scale()
             self.log(
-                "train/pre_render_canonical_scale_caps",
-                float(scale_report["canonical_capped"]),
-            )
-            self.log(
                 "train/pre_render_world_scale_caps",
                 float(scale_report["world_capped"]),
-            )
-            self.log(
-                "train/pre_render_canonical_scale_max",
-                float(scale_report["canonical_before"]),
             )
             self.log(
                 "train/pre_render_world_scale_max",
@@ -4084,6 +4386,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             self._reference_violation = reference.detach() - budget
         proximal, proximal_parts = self._proximal_loss()
         barrier, barrier_parts = self._geometry_barrier(output)
+        mouth_screen, mouth_screen_parts = (
+            self._mouth_screen_preservation_loss(batch, output)
+        )
         chroma, mean_chroma = self._chroma_loss(output)
         spill_weight = float(self.cfg.silhouette_spill_weight)
         silhouette_spill = (
@@ -4101,6 +4406,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             + silhouette
             + proximal
             + barrier
+            + mouth_screen
             + chroma
         )
 
@@ -4117,6 +4423,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             "reference_dual": self.reference_dual,
             "proximal": proximal,
             "barrier": barrier,
+            "mouth_screen": mouth_screen,
             "chroma": chroma,
             "mean_chroma": mean_chroma,
             "open_mouth": float(self._active_open_mouth),
@@ -4125,6 +4432,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         }
         logs.update(proximal_parts)
         logs.update(barrier_parts)
+        logs.update(mouth_screen_parts)
         for name, value in logs.items():
             self.log(f"train/{name}", value.detach() if torch.is_tensor(value) else value)
         for name, value in guidance_out.items():
@@ -4598,33 +4906,8 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         )
 
     @torch.no_grad()
-    def _cap_full_canonical_scale(self) -> tuple[int, float]:
-        """Clamp catastrophic raw-scale jumps before exponentiation/rendering."""
-
-        if not self._full_scale_stability_enabled():
-            return 0, 0.0
-        maximum = float(
-            self.cfg.scale_stability.get(
-                "hard_max_canonical_scale", 0.25
-            )
-        )
-        log_maximum = math.log(maximum)
-        raw = self.gaussian._scaling.data
-        maximum_before = float(
-            torch.exp(raw.max().clamp(max=80.0)).item()
-        )
-        selected = (raw > log_maximum).any(dim=1)
-        count = int(selected.sum().item())
-        if count:
-            raw[selected] = raw[selected].clamp(max=log_maximum)
-            self._clear_parameter_optimizer_rows(
-                self.gaussian._scaling, selected
-            )
-        return count, maximum_before
-
-    @torch.no_grad()
     def _cap_current_full_world_scale(self) -> tuple[int, float]:
-        """Uniformly shrink rows exceeding the aligned current-pose limit."""
+        """Shrink trainable rows exceeding the aligned world-space limit."""
 
         if not self._full_scale_stability_enabled():
             return 0, 0.0
@@ -4633,25 +4916,33 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 "hard_max_world_scale", self.cfg.max_world_scale
             )
         )
-        _, covariance = self._aligned_geometry()
-        eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
-        world_scale = eigenvalues.sqrt().amax(dim=-1)
-        world_scale = torch.nan_to_num(
-            world_scale,
+        _, scales, _ = self._aligned_render_geometry()
+        world_scales = torch.nan_to_num(
+            scales,
             nan=maximum * 2.0,
             posinf=maximum * 2.0,
             neginf=0.0,
         )
-        maximum_before = float(world_scale.max().item())
-        ratio = (maximum / world_scale.clamp_min(1.0e-12)).clamp(max=1.0)
-        selected = ratio < 1.0
+        world_scale = world_scales.amax(dim=-1)
+        eligible = torch.ones_like(world_scale, dtype=torch.bool)
+        if self._full_region_protection_enabled():
+            eligible &= self._active_trainable_point_mask().to(
+                device=world_scale.device, dtype=torch.bool
+            )
+        maximum_before = (
+            float(world_scale[eligible].max().item())
+            if bool(eligible.any().item())
+            else 0.0
+        )
+        axis_ratio = self._full_world_scale_axis_ratio(scales)
+        selected = eligible & (axis_ratio < 1.0).any(dim=-1)
         count = int(selected.sum().item())
         if count:
             indices = torch.nonzero(
                 selected, as_tuple=False
             ).squeeze(1)
             updated = self.gaussian._scaling.data.index_select(0, indices)
-            updated = updated + ratio.index_select(0, indices)[:, None].log()
+            updated = updated + axis_ratio.index_select(0, indices).log()
             self.gaussian._scaling.data.index_copy_(0, indices, updated)
             self._clear_parameter_optimizer_rows(
                 self.gaussian._scaling, selected
@@ -4660,15 +4951,10 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
 
     @torch.no_grad()
     def _stabilize_current_full_scale(self) -> dict[str, float | int]:
-        """Apply canonical and posed hard guards as one atomic repair."""
+        """Apply the optional aligned world-space hard guard."""
 
-        canonical_capped, canonical_before = (
-            self._cap_full_canonical_scale()
-        )
         world_capped, world_before = self._cap_current_full_world_scale()
         return {
-            "canonical_capped": canonical_capped,
-            "canonical_before": canonical_before,
             "world_capped": world_capped,
             "world_before": world_before,
         }
@@ -4681,7 +4967,10 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 self.cfg.mouth.get("max_scale", 0.01),
             )
         )
-        world_scale = self.gaussian.get_world_scale()[:, 0]
+        world_scale = (
+            self.gaussian.get_world_scale()[:, 0]
+            * self._scene_similarity_scale()
+        )
         ratio = (maximum / world_scale.clamp_min(1.0e-12)).clamp(max=1.0)
         selected = self.dental_point_mask & (ratio < 1.0)
         count = int(selected.sum().item())
@@ -4761,22 +5050,15 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             repair = {"updated": 0, "projected": 0}
             if self.gaussian._uv.requires_grad:
                 repair = self.gaussian.update_face_idx_from_uv(
+                    mask=self._active_trainable_point_mask(),
                     return_stats=True
                 )
             self.log("train/rebound_uv_faces", float(repair["updated"]))
             self.log("train/projected_uv", float(repair["projected"]))
             scale_report = self._stabilize_current_full_scale()
             self.log(
-                "train/post_step_canonical_scale_caps",
-                float(scale_report["canonical_capped"]),
-            )
-            self.log(
                 "train/post_step_world_scale_caps",
                 float(scale_report["world_capped"]),
-            )
-            self.log(
-                "train/post_step_canonical_scale_max",
-                float(scale_report["canonical_before"]),
             )
             self.log(
                 "train/post_step_world_scale_max",
@@ -4991,9 +5273,9 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
         checkpoint["stage2_sdedit_updates_started"] = bool(
             int(self.true_global_step) > self.sdedit_start_step
         )
-        checkpoint["stage2_full_scale_stability_version"] = 1
-        checkpoint["stage2_full_region_protection_version"] = int(
-            self._full_region_protection_enabled()
+        checkpoint["stage2_full_scale_stability_version"] = 4
+        checkpoint["stage2_full_region_protection_version"] = (
+            2 if self._full_region_protection_enabled() else 0
         )
         checkpoint["stage2_gaussian"] = self._gaussian_state()
         checkpoint["stage2_completed_densification_steps"] = sorted(
@@ -5036,15 +5318,15 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             and "stage2_uvd_surface_flow" in checkpoint
         ):
             raise ValueError(
-                "This checkpoint contains the obsolete probability-flow "
-                "UVD-SFD state. Start UVD-consistent ISM from its verified "
+                "This checkpoint contains an obsolete UVD-SFD state. Start "
+                "the CFD-consistent score-difference objective from its verified "
                 "PLY export instead of resuming the old trajectory."
             )
         saved_d_range = checkpoint.get("stage2_uvd_flow_d_range")
         if saved_d_range is not None:
             if self.uvd_flow_d_range is None:
                 raise ValueError(
-                    "Checkpoint contains UVD-ISM state but the current "
+                    "Checkpoint contains UVD-SFD state but the current "
                     "configuration disables it"
                 )
             saved_d_range = torch.as_tensor(
@@ -5059,7 +5341,7 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                 )
             ):
                 raise ValueError(
-                    "UVD-ISM checkpoint canonical d range differs from the "
+                    "UVD-SFD checkpoint canonical d range differs from the "
                     "current initialization/configuration"
                 )
         if (
@@ -5069,13 +5351,13 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                     "stage2_full_region_protection_version", 0
                 )
             )
-            < 1
+            < 2
         ):
             raise ValueError(
-                "This full-pass checkpoint predates eye/dental region "
-                "protection and may already contain corrupted eyes or mouth. "
-                "Do not resume full_scale_stable; start a fresh full run "
-                "from the verified mouth PLY."
+                "This full-pass checkpoint predates protected face-binding "
+                "and screen-space mouth preservation and may already contain "
+                "a corrupted mouth. Start a fresh full run from the verified "
+                "mouth PLY."
             )
         if (
             self._full_scale_stability_enabled()
@@ -5084,13 +5366,12 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                     "stage2_full_scale_stability_version", 0
                 )
             )
-            < 1
+            < 4
         ):
             raise ValueError(
-                "This full-pass checkpoint predates the scale-stability fix "
-                "and may already contain needle/giant Gaussians or a corrupt "
-                "fixed SDEdit source. Do not resume full_repaired; start a "
-                "fresh full run from the verified mouth PLY."
+                "This full-pass checkpoint predates the absolute world-space "
+                "anisotropy guard and may already contain needle-like scales. "
+                "Start a fresh full run from the verified mouth PLY."
             )
         self._sdedit_optimizer_state_reset = bool(
             checkpoint.get("stage2_sdedit_optimizer_state_reset", False)
@@ -5202,6 +5483,25 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
                         f"reconstruction for field {key}."
                     )
                 restored_state[key] = restored.detach().clone()
+            saved_scale_mask = sdedit_state.get("scale_trainable_mask")
+            if saved_scale_mask is None:
+                # Older checkpoints captured the SDEdit source only after the
+                # final ISM topology was installed, so the refreshed live mask
+                # is the topology-compatible fallback.
+                saved_scale_mask = self._active_trainable_point_mask()
+            restored_scale_mask = torch.as_tensor(
+                saved_scale_mask,
+                dtype=torch.bool,
+                device=self.gaussian.device,
+            ).reshape(-1)
+            if restored_scale_mask.shape[0] != self.gaussian.num_gs:
+                raise ValueError(
+                    "SDEdit checkpoint scale-protection mask topology differs "
+                    "from the restored Gaussian topology."
+                )
+            restored_state["scale_trainable_mask"] = (
+                restored_scale_mask.detach().clone()
+            )
             self._sdedit_reference_state = restored_state
         vsd_state = checkpoint.get("stage2_vsd")
         if vsd_state is not None:
@@ -5269,6 +5569,8 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             facelift_from_training=self.alignment.detach().cpu().numpy(),
             flame_scale=np.float32(self.gaussian.flame_scale),
             spatial_lr_scale=np.float32(self.gaussian.spatial_lr_scale),
+            scale_rotation_space=np.asarray("flame_face_local_v1"),
+            representation_schema_version=np.int64(2),
             optimization_stage=np.asarray(self.optimization_stage),
             initialization_ply=np.asarray(str(self.initialization_ply)),
             optimizer_executed_steps=np.int64(optimizer_executed_steps),
@@ -5333,7 +5635,6 @@ class Head3DGSLKsReconstructionFinetune(BaseLift3DSystem):
             report = self._stabilize_current_full_scale()
             threestudio.info(
                 "Final full-pass scale cap in the reference pose: "
-                f"canonical={report['canonical_capped']}, "
                 f"world={report['world_capped']}, "
                 f"world_max_before={report['world_before']:.6f}."
             )

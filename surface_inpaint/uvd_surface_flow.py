@@ -1,4 +1,4 @@
-"""Canonical UVD noise transport for Stage-2 UVD-consistent ISM.
+"""Canonical UVD/CFD noise transport for first-phase UVD-SFD.
 
 The animated avatar does not merely live on one FLAME UV sheet.  Every
 Gaussian is attached by ``(surface_layer, u, v, d)`` where ``d`` is its signed
@@ -190,12 +190,12 @@ class UVDNoiseVolume:
 
         step = int(step)
         if step < 0:
-            raise ValueError("UVD-ISM optimizer step must be non-negative")
+            raise ValueError("UVD-SFD optimizer step must be non-negative")
         if step == self.last_resample_step:
             return
         if self.last_resample_step >= 0 and step < self.last_resample_step:
             raise ValueError(
-                "UVD-ISM optimizer step moved backwards without restoring "
+                "UVD-SFD optimizer step moved backwards without restoring "
                 "its checkpoint"
             )
         # The constructor already supplied the first iid draw.  Avoid drawing

@@ -2,7 +2,7 @@
 
 This is the current UVD-FLAME counterpart of AnimPortrait3D/GSAvatar's
 ``train_mouth.py``.  It keeps the original ISM path as the default ablation,
-optionally couples that same ISM noise through canonical UVD correspondence,
+optionally uses canonical UVD/CFD noise for a paired UVD-SFD score difference,
 then runs the selected SDEdit phase.  It keeps the
 reconstructed identity, topology and non-teeth Gaussians fixed, permits small
 face-bounded UVD corrections on teeth, and exports a chained UVD PLY for
@@ -110,8 +110,8 @@ def parse_args() -> argparse.Namespace:
         choices=GUIDANCE_MODES,
         default="ism",
         help=(
-            "First phase: original AnimPortrait3D ISM or UVD-consistent "
-            "ISM (historical label 'uvd-sfd')"
+            "First phase: original AnimPortrait3D ISM or CFD-consistent "
+            "UVD-SFD"
         ),
     )
     parser.add_argument(

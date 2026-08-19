@@ -56,7 +56,7 @@ from .layered_surface import (
     encode_surface_rgb_residual,
     normalize_alpha_weighted,
 )
-from .stability import stabilize_uvd_covariances
+from .stability import stabilize_face_local_covariances
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1282,15 +1282,16 @@ class UVDAvatar:
         from gaussiansplatting.scene.gaussian_flame_face import (
             GaussianFlameUVModel,
         )
-        from gaussiansplatting.utils.general_utils import strip_symmetric
         from gaussiansplatting.utils.sh_utils import SH2RGB
-        from train_reconstruction import OpenCVCamera, aligned_geometry
+        from train_reconstruction import (
+            OpenCVCamera,
+            aligned_scaling_rotation,
+        )
 
         self._render = render
-        self._strip_symmetric = strip_symmetric
         self._SH2RGB = SH2RGB
         self._OpenCVCamera = OpenCVCamera
-        self._aligned_geometry_fn = aligned_geometry
+        self._aligned_geometry_fn = aligned_scaling_rotation
         self.device = device
         self.reconstruction_dir = reconstruction_dir
 
@@ -1350,12 +1351,20 @@ class UVDAvatar:
             named_poses = list(
                 stability_poses or (("reference", self.reference_pose),)
             )
-            self.stability_report = stabilize_uvd_covariances(
+            self.stability_report = stabilize_face_local_covariances(
                 self.gaussian,
                 named_poses,
                 self._set_stability_pose,
                 stability_config,
                 reference_pose=self.reference_pose,
+                world_scale_multiplier=float(
+                    self.alignment[:3, :3]
+                    .square()
+                    .sum()
+                    .div(3.0)
+                    .sqrt()
+                    .item()
+                ),
             )
 
         self.initial = {
@@ -1589,12 +1598,14 @@ class UVDAvatar:
         ]
 
     @torch.no_grad()
-    def packed_geometry(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def packed_geometry(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         with torch.cuda.amp.autocast(enabled=False):
-            means, covariance = self._aligned_geometry_fn(
+            means, scales, rotations = self._aligned_geometry_fn(
                 self.gaussian, self.alignment
             )
-        return means.detach(), self._strip_symmetric(covariance.detach())
+        return means.detach(), scales.detach(), rotations.detach()
 
     @torch.no_grad()
     def _correspondence_opacity(self) -> torch.Tensor:

@@ -642,6 +642,8 @@ def main() -> None:
             facelift_from_training=alignment.detach().cpu().numpy(),
             flame_scale=np.float32(model_cfg["flame_scale"]),
             spatial_lr_scale=np.float32(model_cfg["spatial_lr_scale"]),
+            scale_rotation_space=np.asarray("flame_face_local_v1"),
+            representation_schema_version=np.int64(2),
             joint_camera_file=np.asarray(str(camera_path)),
             joint_flame_parameter_file=np.asarray(str(flame_path)),
         )

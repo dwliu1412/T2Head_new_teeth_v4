@@ -86,9 +86,8 @@ python train_full.py `
 ```
 
 The default output names are `mouth_surface_sdedit` and
-`full_surface_sdedit`; UVD-consistent ISM (historical CLI label `uvd-sfd`)
-combinations additionally contain the
-`uvd_sfd` suffix.  This prevents an experimental result from overwriting or
+`full_surface_sdedit`; CFD-consistent UVD-SFD combinations additionally
+contain the `uvd_sfd` suffix.  This prevents an experimental result from overwriting or
 being mistaken for the independent baseline.
 
 The CLI raises `data.batch_size` only for the surface branch. Its sampler first

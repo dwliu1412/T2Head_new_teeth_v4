@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Dict, Optional
 
@@ -23,19 +24,20 @@ from gaussiansplatting.utils.system_utils import mkdir_p
 
 
 class GaussianFlameUVModel(GaussianModel):
-    """FLAME-bound Gaussian model with canonical UVD parameters.
+    """FLAME-bound Gaussians with UVD centres and face-local ellipsoids.
 
     Each Gaussian is attached to one FLAME face through ``(face_idx, u, v, d)``.
-    UVD is the only canonical geometry; world-space means and covariances are
-    derived from the posed FLAME surface and its local Jacobian.
+    The centre keeps the existing movable UV plus normal-offset representation.
+    Scale and rotation are learned in the orthonormal frame of the parent face,
+    following GaussianAvatars, and are explicitly composed with the posed face
+    frame before rasterization.  No UVD Jacobian is used for the ellipsoid.
     """
 
     EPS = 1e-6
     UV_EPS = 1e-6
     SIGMA_FLOOR = 1e-4
-    JACOBIAN_MIN_SINGULAR_VALUE = 1e-4
-    JACOBIAN_MAX_CONDITION = 10.0
     DEFAULT_MAX_GAUSSIANS = 500_000
+    SCALE_ROTATION_COMMENT = "scale_rotation_space=flame_face_local_v1"
     # Effective normalized colours loaded by AnimPortrait3D after its rigged
     # point-cloud initializer stores the RGB fields as uint8.
     ANIM_PORTRAIT3D_TEETH_RGB = (
@@ -48,24 +50,23 @@ class GaussianFlameUVModel(GaussianModel):
         30.0 / 255.0,
         29.0 / 255.0,
     )
-    covariance_space = "uvd"
-    requires_precomputed_covariance = True
+    covariance_space = "face_local"
+    requires_precomputed_covariance = False
 
     def setup_functions(self):
-        def covariance_from_uvd(scaling, scaling_modifier, rotation):
-            verts, normals = self._flame_verts_and_normals()
-            jacobian = self._uvd_jacobian(verts, normals)
-            covariance = self._world_covariance_matrix(
-                jacobian,
-                scaling,
-                rotation,
-                scaling_modifier=scaling_modifier,
-            )
+        def covariance_from_scaling_rotation(
+            scaling, scaling_modifier, rotation
+        ):
+            rotation_matrix = build_rotation(F.normalize(rotation, dim=-1))
+            factor = rotation_matrix * (
+                float(scaling_modifier) * scaling
+            )[:, None, :]
+            covariance = torch.bmm(factor, factor.transpose(1, 2))
             return strip_symmetric(covariance)
 
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-        self.covariance_activation = covariance_from_uvd
+        self.covariance_activation = covariance_from_scaling_rotation
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
@@ -192,6 +193,34 @@ class GaussianFlameUVModel(GaussianModel):
         return self._uv
 
     @property
+    def get_local_scaling(self) -> torch.Tensor:
+        """Learned Gaussian scales in the parent-face coordinate system."""
+
+        return self.scaling_activation(self._scaling)
+
+    @property
+    def get_local_rotation(self) -> torch.Tensor:
+        """Learned Gaussian rotations in the parent-face coordinate system."""
+
+        return self.rotation_activation(self._rotation)
+
+    @property
+    def get_scaling(self) -> torch.Tensor:
+        """Current posed world-space scales (before any scene alignment)."""
+
+        vertices, _ = self._flame_verts_and_normals()
+        scaling, _ = self._deformed_scaling_rotation(vertices)
+        return scaling
+
+    @property
+    def get_rotation(self) -> torch.Tensor:
+        """Current posed world-space WXYZ quaternions."""
+
+        vertices, _ = self._flame_verts_and_normals()
+        _, rotation = self._deformed_scaling_rotation(vertices)
+        return rotation
+
+    @property
     def get_xyz(self):
         verts, normals = self._flame_verts_and_normals()
         return self._map_uvd_to_xyz(
@@ -303,175 +332,177 @@ class GaussianFlameUVModel(GaussianModel):
         surface_normal = self._normalize_safe(w0[:, None] * n0 + w1[:, None] * n1 + w2[:, None] * n2)
         return surface + uvd[:, 2:3] * surface_normal
 
-    def _raw_uvd_jacobian(
+    def _offset_uvd_by_world_delta(
         self,
+        uv: torch.Tensor,
+        d: torch.Tensor,
+        face_idx: torch.Tensor,
+        world_delta: torch.Tensor,
         vertices: torch.Tensor,
         normals: torch.Tensor,
-        face_idx: Optional[torch.Tensor] = None,
-        uv: Optional[torch.Tensor] = None,
-        d: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        face_idx = self._face_idx if face_idx is None else face_idx
-        uv = self._uv if uv is None else uv
-        d = self._d if d is None else d
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply a physical split offset while retaining the UVD centre form."""
+
         face_idx = face_idx.long().clamp(0, self._faces.shape[0] - 1)
-
-        triangle = self._faces[face_idx]
-        p0, p1, p2 = vertices[triangle[:, 0]], vertices[triangle[:, 1]], vertices[triangle[:, 2]]
-        n0, n1, n2 = normals[triangle[:, 0]], normals[triangle[:, 1]], normals[triangle[:, 2]]
         w0, w1, w2, _ = self._face_barycentric_uv(uv, face_idx)
-        normal_raw = w0[:, None] * n0 + w1[:, None] * n1 + w2[:, None] * n2
-        normal_norm = normal_raw.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        normal = normal_raw / normal_norm
+        triangle = self._faces[face_idx]
+        p0 = vertices[triangle[:, 0]]
+        p1 = vertices[triangle[:, 1]]
+        p2 = vertices[triangle[:, 2]]
+        n0 = normals[triangle[:, 0]]
+        n1 = normals[triangle[:, 1]]
+        n2 = normals[triangle[:, 2]]
+        surface = w0[:, None] * p0 + w1[:, None] * p1 + w2[:, None] * p2
+        surface_normal = self._normalize_safe(
+            w0[:, None] * n0 + w1[:, None] * n1 + w2[:, None] * n2
+        )
+        normal_delta = (world_delta * surface_normal).sum(
+            dim=-1, keepdim=True
+        )
+        target_surface = surface + world_delta - normal_delta * surface_normal
+        new_w0, new_w1, new_w2 = self._barycentric_3d(
+            target_surface, p0, p1, p2
+        )
+        uv_triangle = self.vt[self.ft[face_idx]]
+        new_uv = (
+            new_w0[:, None] * uv_triangle[:, 0]
+            + new_w1[:, None] * uv_triangle[:, 1]
+            + new_w2[:, None] * uv_triangle[:, 2]
+        )
+        return new_uv, d + normal_delta
 
-        inverse = self.face_uv_inv[face_idx]
-        position_edges = torch.stack([p1 - p0, p2 - p0], dim=-1)
-        normal_edges = torch.stack([n1 - n0, n2 - n0], dim=-1)
-        position_duv = torch.bmm(position_edges, inverse)
-        normal_raw_duv = torch.bmm(normal_edges, inverse)
-        identity = torch.eye(3, dtype=normal.dtype, device=normal.device).expand(normal.shape[0], -1, -1)
-        projector = identity - normal[:, :, None] * normal[:, None, :]
-        normal_duv = torch.bmm(projector, normal_raw_duv) / normal_norm[:, :, None]
-        tangent = position_duv + d[:, None, :] * normal_duv
-        return torch.cat([tangent, normal[:, :, None]], dim=-1)
+    @classmethod
+    def _face_orientation_and_scale(
+        cls, vertices: torch.Tensor, faces: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return GaussianAvatars-style orthonormal frames and face scales.
 
-    def _stabilize_jacobian(self, jacobian: torch.Tensor) -> torch.Tensor:
-        # SVD reconstruction and batched matmul are numerically sensitive and
-        # autocast may turn only the bmm result into FP16.  That both degrades
-        # the repair and makes indexed assignment fail (FP32 destination,
-        # FP16 source).  Geometry remains differentiable, but is always
-        # evaluated in FP32.
-        with torch.autocast(device_type=jacobian.device.type, enabled=False):
-            safe = torch.nan_to_num(
-                jacobian.float(), nan=0.0, posinf=0.0, neginf=0.0
-            )
-            finite = torch.isfinite(jacobian).flatten(1).all(dim=1)
-            with torch.no_grad():
-                detached = safe.detach()
-                a, b, c = detached.unbind(dim=2)
-                bc = torch.cross(b, c, dim=1)
-                ca = torch.cross(c, a, dim=1)
-                ab = torch.cross(a, b, dim=1)
-                frobenius = detached.flatten(1).norm(dim=1)
-                adjugate_norm = (
-                    bc.square().sum(1)
-                    + ca.square().sum(1)
-                    + ab.square().sum(1)
-                ).sqrt()
-                determinant = (a * bc).sum(1).abs()
-                condition_upper_bound = (
-                    frobenius
-                    * adjugate_norm
-                    / determinant.clamp_min(torch.finfo(detached.dtype).tiny)
-                )
-                candidates = finite & (
-                    (condition_upper_bound > self.JACOBIAN_MAX_CONDITION)
-                    | (
-                        frobenius
-                        < (
-                            3.0 ** 0.5
-                            * self.JACOBIAN_MAX_CONDITION
-                            * self.JACOBIAN_MIN_SINGULAR_VALUE
-                        )
-                    )
-                )
-                candidate_indices = torch.nonzero(
-                    candidates, as_tuple=False
-                ).squeeze(1)
-                u, singular_values, vh = torch.linalg.svd(
-                    detached[candidate_indices], full_matrices=False
-                )
-                largest = singular_values[:, :1].clamp_min(
-                    self.JACOBIAN_MIN_SINGULAR_VALUE
-                )
-                floor = torch.maximum(
-                    largest / self.JACOBIAN_MAX_CONDITION,
-                    torch.full_like(
-                        largest, self.JACOBIAN_MIN_SINGULAR_VALUE
-                    ),
-                )
-                repair = singular_values[:, -1] < floor[:, 0]
-                repair_indices = candidate_indices[repair]
-                stabilized = detached.clone()
-                repaired_singular_values = torch.maximum(
-                    singular_values[repair], floor[repair]
-                )
-                stabilized[repair_indices] = torch.bmm(
-                    u[repair] * repaired_singular_values[:, None, :],
-                    vh[repair],
-                )
-                identity = torch.eye(
-                    3, dtype=safe.dtype, device=safe.device
-                ).expand_as(stabilized)
-                stabilized = torch.where(
-                    finite[:, None, None], stabilized, identity
-                )
-                needs_stabilization = ~finite
-                needs_stabilization[repair_indices] = True
-            corrected = safe + (stabilized - safe).detach()
-            return torch.where(
-                needs_stabilization[:, None, None], corrected, safe
-            )
+        Frame columns are the first edge, face normal, and the remaining
+        in-plane axis.  The scalar is the average of the first-edge length and
+        the triangle altitude, matching the official GaussianAvatars code.
+        Degenerate faces receive an identity frame and a small positive scale.
+        """
 
-    def _uvd_jacobian(
+        triangle = vertices[faces.long()]
+        edge0 = triangle[:, 1] - triangle[:, 0]
+        edge1 = triangle[:, 2] - triangle[:, 0]
+        edge0_length = edge0.norm(dim=-1, keepdim=True)
+        axis0 = cls._normalize_safe(edge0)
+        normal_raw = torch.cross(axis0, edge1, dim=-1)
+        normal_length = normal_raw.norm(dim=-1, keepdim=True)
+        axis1 = cls._normalize_safe(normal_raw)
+        axis2 = -cls._normalize_safe(torch.cross(axis1, axis0, dim=-1))
+        orientation = torch.stack((axis0, axis1, axis2), dim=-1)
+        altitude = (axis2 * edge1).sum(dim=-1, keepdim=True).abs()
+        face_scale = 0.5 * (edge0_length + altitude)
+
+        finite = (
+            torch.isfinite(orientation).flatten(1).all(dim=1)
+            & torch.isfinite(face_scale[:, 0])
+        )
+        valid = finite & (edge0_length[:, 0] > cls.EPS) & (
+            normal_length[:, 0] > cls.EPS
+        )
+        identity = torch.eye(
+            3, dtype=vertices.dtype, device=vertices.device
+        ).expand(orientation.shape[0], -1, -1)
+        orientation = torch.where(valid[:, None, None], orientation, identity)
+        face_scale = torch.nan_to_num(
+            face_scale, nan=cls.EPS, posinf=cls.EPS, neginf=cls.EPS
+        ).clamp_min(cls.EPS)
+        return orientation, face_scale
+
+    def _face_properties(
         self,
         vertices: torch.Tensor,
-        normals: torch.Tensor,
         face_idx: Optional[torch.Tensor] = None,
-        uv: Optional[torch.Tensor] = None,
-        d: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self._stabilize_jacobian(
-            self._raw_uvd_jacobian(vertices, normals, face_idx, uv, d)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        face_idx = self._face_idx if face_idx is None else face_idx
+        face_idx = face_idx.long().clamp(0, self._faces.shape[0] - 1)
+        return self._face_orientation_and_scale(
+            vertices, self._faces[face_idx]
         )
 
-    @staticmethod
-    def _stable_jacobian_inverse(jacobian: torch.Tensor) -> torch.Tensor:
-        identity = torch.eye(
-            3, dtype=jacobian.dtype, device=jacobian.device
-        ).expand_as(jacobian)
-        return torch.linalg.solve(jacobian, identity)
+    def current_covariance_transform(self) -> torch.Tensor:
+        """Map a face-local covariance factor into the current FLAME pose."""
 
-    def _world_covariance_matrix(
+        vertices, _ = self._flame_verts_and_normals()
+        orientation, face_scale = self._face_properties(vertices)
+        return orientation * face_scale[:, None, :]
+
+    def _deformed_scaling_rotation(
         self,
-        jacobian: torch.Tensor,
-        scaling: torch.Tensor,
-        rotation: torch.Tensor,
+        vertices: torch.Tensor,
+        face_idx: Optional[torch.Tensor] = None,
+        local_scaling: Optional[torch.Tensor] = None,
+        local_rotation: Optional[torch.Tensor] = None,
         scaling_modifier: float = 1.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compose learned face-local ellipsoids into the posed world frame."""
+
+        local_scaling = (
+            self.get_local_scaling
+            if local_scaling is None
+            else local_scaling
+        )
+        local_rotation = (
+            self.get_local_rotation
+            if local_rotation is None
+            else self.rotation_activation(local_rotation)
+        )
+        face_orientation, face_scale = self._face_properties(
+            vertices, face_idx
+        )
+        world_scaling = (
+            float(scaling_modifier) * face_scale * local_scaling
+        ).clamp_min(self.SIGMA_FLOOR)
+        world_rotation_matrix = torch.bmm(
+            face_orientation, build_rotation(local_rotation)
+        )
+        world_rotation = F.normalize(
+            matrix_to_quaternion(world_rotation_matrix), dim=-1
+        )
+        return world_scaling, world_rotation
+
+    @staticmethod
+    def _covariance_matrix_from_scaling_rotation(
+        scaling: torch.Tensor, rotation: torch.Tensor
     ) -> torch.Tensor:
-        rotation_matrix = build_rotation(self.rotation_activation(rotation))
-        factor = torch.bmm(jacobian, rotation_matrix * (scaling_modifier * scaling)[:, None, :])
-        covariance = torch.bmm(factor, factor.transpose(1, 2))
-        eye = torch.eye(3, dtype=covariance.dtype, device=covariance.device)[None]
-        return covariance + eye * (self.SIGMA_FLOOR ** 2)
+        rotation_matrix = build_rotation(F.normalize(rotation, dim=-1))
+        factor = rotation_matrix * scaling[:, None, :]
+        return torch.bmm(factor, factor.transpose(1, 2))
+
+    def get_covariance(self, scaling_modifier: float = 1.0) -> torch.Tensor:
+        vertices, _ = self._flame_verts_and_normals()
+        scaling, rotation = self._deformed_scaling_rotation(
+            vertices, scaling_modifier=scaling_modifier
+        )
+        return strip_symmetric(
+            self._covariance_matrix_from_scaling_rotation(scaling, rotation)
+        )
 
     def get_deformed_gaussians(
         self, scaling_modifier: float = 1.0
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         vertices, normals = self._flame_verts_and_normals()
         xyz = self._map_uvd_to_xyz(
             torch.cat([self._uv, self._d], dim=1), vertices, normals
         )
-        covariance = self._world_covariance_matrix(
-            self._uvd_jacobian(vertices, normals),
-            self.get_scaling,
-            self._rotation,
-            scaling_modifier,
-        )
-        return xyz, strip_symmetric(covariance)
+        # ``GaussianRasterizationSettings.scale_modifier`` is applied by the
+        # CUDA rasterizer to explicit scales.  Keep these unmodified to avoid
+        # applying a non-unit preview modifier twice.
+        scaling, rotation = self._deformed_scaling_rotation(vertices)
+        return xyz, scaling, rotation
 
     def get_world_scale(self) -> torch.Tensor:
-        with torch.autocast(device_type=self.device.type, enabled=False):
-            vertices, normals = self._flame_verts_and_normals()
-            jacobian = self._uvd_jacobian(vertices, normals)
-            rotation = build_rotation(self.get_rotation.float())
-            factor = torch.bmm(
-                jacobian, rotation * self.get_scaling.float()[:, None, :]
-            )
-            return torch.linalg.svdvals(factor)
+        vertices, _ = self._flame_verts_and_normals()
+        scaling, _ = self._deformed_scaling_rotation(vertices)
+        return torch.sort(scaling, dim=-1, descending=True).values
 
     def get_world_scale_max_approx(self) -> torch.Tensor:
-        return self.get_world_scale()[:, 0]
+        vertices, _ = self._flame_verts_and_normals()
+        scaling, _ = self._deformed_scaling_rotation(vertices)
+        return scaling.amax(dim=-1)
 
     def _build_uv_grid(self, resolution: int = 256) -> None:
         vt = self.vt.detach().cpu().numpy()
@@ -612,17 +643,53 @@ class GaussianFlameUVModel(GaussianModel):
             uv[repair], old_faces[repair], eps
         )
         repair_indices = indices[repair]
-        updated = int((repaired_faces != old_faces[repair]).sum().item())
+        changed_face = repaired_faces != old_faces[repair]
+        updated = int(changed_face.sum().item())
+        changed_indices = repair_indices[changed_face]
+        if updated:
+            # UV is intentionally allowed to cross triangle boundaries.  The
+            # learned ellipsoid is expressed in the parent-face frame, so a
+            # binding change must be a pure reparameterization: preserve its
+            # current world scale/rotation and express them in the new frame.
+            vertices, _ = self._flame_verts_and_normals()
+            old_orientation, old_face_scale = self._face_properties(
+                vertices, old_faces[repair][changed_face]
+            )
+            new_orientation, new_face_scale = self._face_properties(
+                vertices, repaired_faces[changed_face]
+            )
+            local_scaling = self.get_local_scaling[changed_indices]
+            preserved_world_scaling = old_face_scale * local_scaling
+            self._scaling.data[changed_indices] = (
+                preserved_world_scaling / new_face_scale
+            ).clamp_min(torch.finfo(local_scaling.dtype).tiny).log()
+
+            local_rotation = build_rotation(
+                self.get_local_rotation[changed_indices]
+            )
+            preserved_world_rotation = torch.bmm(
+                old_orientation, local_rotation
+            )
+            rebound_local_rotation = torch.bmm(
+                new_orientation.transpose(1, 2), preserved_world_rotation
+            )
+            self._rotation.data[changed_indices] = F.normalize(
+                matrix_to_quaternion(rebound_local_rotation), dim=-1
+            )
         self._face_idx[repair_indices] = repaired_faces
         self._uv.data[repair_indices] = repaired_uv.clamp(self.UV_EPS, 1.0 - self.UV_EPS)
         if self.optimizer is not None:
             for group in self.optimizer.param_groups:
-                if group["name"] != "uv":
+                if group["name"] == "uv":
+                    reset_indices = repair_indices
+                elif group["name"] in {"scaling", "rotation"}:
+                    reset_indices = changed_indices
+                else:
                     continue
                 state = self.optimizer.state.get(group["params"][0], {})
                 for name in ("exp_avg", "exp_avg_sq"):
-                    if name in state:
-                        state[name][repair_indices] = 0
+                    if name in state and reset_indices.numel():
+                        state[name][reset_indices] = 0
         if return_stats:
             return {"updated": updated, "projected": int(projected.sum().item())}
         return None
@@ -736,12 +803,12 @@ class GaussianFlameUVModel(GaussianModel):
             torch.full((num_points, 3), 0.5, dtype=torch.float32, device=self.device)
         )
         distance2 = torch.clamp_min(distCUDA2(self.get_xyz), 1e-7)
-        jacobian = self._uvd_jacobian(*self._flame_verts_and_normals())
-        jacobian_inverse = self._stable_jacobian_inverse(jacobian)
-        canonical_covariance = (distance2[:, None, None] * torch.bmm(
-            jacobian_inverse, jacobian_inverse.transpose(1, 2)
-        ))
-        scales, rotations = self._covariance_to_scaling_rotation(canonical_covariance)
+        _, face_scale = self._face_properties(vertices, face_idx)
+        scales = distance2.sqrt()[:, None].repeat(1, 3) / face_scale
+        rotations = torch.zeros(
+            (num_points, 4), dtype=torch.float32, device=self.device
+        )
+        rotations[:, 0] = 1.0
         self._features_dc = nn.Parameter(
             features[:, :, :1].transpose(1, 2).contiguous().requires_grad_(True)
         )
@@ -827,9 +894,10 @@ class GaussianFlameUVModel(GaussianModel):
         intentional overlap between the ``teeth`` and ``oral_cavity`` vertex
         masks, so each surface receives its own colour prior.
 
-        The new covariance starts approximately isotropic in posed world space
-        and is pulled back through the local UVD Jacobian.  Consequently it
-        deforms with the same FLAME map as all reconstructed Gaussians.
+        The new ellipsoid starts approximately isotropic in posed world space.
+        Its learned scale is divided by the parent-face scale and its local
+        rotation starts at identity, so later FLAME poses can compose it using
+        only the explicit face frame.
         """
 
         count = int(num_points)
@@ -910,20 +978,12 @@ class GaussianFlameUVModel(GaussianModel):
                 device=self.device,
             )
         distance2 = distance2.clamp_max(max_world_scale ** 2)
-        jacobian = self._uvd_jacobian(
-            vertices,
-            normals,
-            face_idx=sampled_faces,
-            uv=uv,
-            d=d,
+        _, face_scale = self._face_properties(vertices, sampled_faces)
+        scales = distance2.sqrt()[:, None].repeat(1, 3) / face_scale
+        rotations = torch.zeros(
+            (count, 4), dtype=torch.float32, device=self.device
         )
-        jacobian_inverse = self._stable_jacobian_inverse(jacobian)
-        canonical_covariance = distance2[:, None, None] * torch.bmm(
-            jacobian_inverse, jacobian_inverse.transpose(1, 2)
-        )
-        scales, rotations = self._covariance_to_scaling_rotation(
-            canonical_covariance
-        )
+        rotations[:, 0] = 1.0
 
         color = torch.as_tensor(
             rgb, dtype=torch.float32, device=self.device
@@ -1050,7 +1110,10 @@ class GaussianFlameUVModel(GaussianModel):
             shape_vertex[f"shape_{index}"] = shape[:, index]
         PlyData(
             [PlyElement.describe(vertex, "vertex"), PlyElement.describe(shape_vertex, "shape")],
-            comments=["coordinate_space=flame_uvd"],
+            comments=[
+                "coordinate_space=flame_uvd",
+                self.SCALE_ROTATION_COMMENT,
+            ],
         ).write(path)
 
     @staticmethod
@@ -1065,8 +1128,20 @@ class GaussianFlameUVModel(GaussianModel):
             raise ValueError(f"Expected {expected} {prefix} fields, found {len(names)}")
         return np.stack([np.asarray(vertex[name], dtype=np.float32) for name in names], axis=1)
 
-    def load_ply(self, path: str) -> None:
+    def load_ply(
+        self, path: str, *, allow_legacy_scale_rotation: bool = False
+    ) -> None:
         ply = PlyData.read(path)
+        comments = {str(comment).strip() for comment in ply.comments}
+        if (
+            self.SCALE_ROTATION_COMMENT not in comments
+            and not allow_legacy_scale_rotation
+        ):
+            raise ValueError(
+                "The PLY stores legacy UVD-space scale/rotation. This model "
+                "requires face-local scale/rotation; rerun reconstruction or "
+                "convert the legacy model with tools/convert_legacy_uvd_ply.py."
+            )
         vertex = ply.elements[0]
         names = set(vertex.data.dtype.names)
         required = {"u", "v", "d", "face_idx", "opacity", "f_dc_0", "f_dc_1", "f_dc_2"}
@@ -1332,28 +1407,18 @@ class GaussianFlameUVModel(GaussianModel):
         densify_mask: Optional[torch.Tensor] = None,
         max_gaussians: Optional[int] = None,
     ) -> dict[str, int]:
-        opacity = self.get_opacity.squeeze(-1)
-        prune = opacity < min_opacity
-        if max_screen_size is not None:
-            prune |= self.max_radii2D > float(max_screen_size)
         if protected_mask is not None:
             protected_mask = protected_mask.to(
                 device=self.device, dtype=torch.bool
             )
             if protected_mask.numel() != self.num_gs:
                 raise ValueError("Protected mask has the wrong number of Gaussians")
-            prune &= ~protected_mask
         if densify_mask is not None:
             densify_mask = densify_mask.to(
                 device=self.device, dtype=torch.bool
             )
             if densify_mask.numel() != self.num_gs:
                 raise ValueError("Densification mask has the wrong number of Gaussians")
-        pruned = int(prune.sum().item())
-        if prune.any():
-            if densify_mask is not None:
-                densify_mask = densify_mask[~prune]
-            self.prune_points(prune)
 
         budget_limit = (
             self.DEFAULT_MAX_GAUSSIANS
@@ -1389,6 +1454,17 @@ class GaussianFlameUVModel(GaussianModel):
         split = int(split_mask.sum().item())
 
         if cloned or split:
+            post_protected_mask = None
+            if protected_mask is not None:
+                protection_parts = [protected_mask[clone_mask]]
+                if split:
+                    protection_parts.append(
+                        protected_mask[split_mask].repeat(2)
+                    )
+                post_protected_mask = torch.cat(
+                    [protected_mask, *protection_parts], dim=0
+                )
+
             uv_parts = [self._uv[clone_mask]]
             d_parts = [self._d[clone_mask]]
             dc_parts = [self._features_dc[clone_mask]]
@@ -1399,21 +1475,41 @@ class GaussianFlameUVModel(GaussianModel):
             face_parts = [self._face_idx[clone_mask]]
 
             if split:
+                vertices, normals = self._flame_verts_and_normals()
+                split_faces = self._face_idx[split_mask]
+                split_local_scaling = self.get_local_scaling[split_mask]
+                split_local_rotation = self.get_local_rotation[split_mask]
+                split_world_scaling, split_world_rotation = (
+                    self._deformed_scaling_rotation(
+                        vertices,
+                        face_idx=split_faces,
+                        local_scaling=split_local_scaling,
+                        local_rotation=split_local_rotation,
+                    )
+                )
                 samples = torch.randn(
                     (split * 2, 3), dtype=self._uv.dtype, device=self.device
                 )
-                samples *= self.get_scaling[split_mask].repeat(2, 1)
+                samples *= split_world_scaling.repeat(2, 1)
                 delta = torch.bmm(
-                    build_rotation(self.get_rotation[split_mask]).repeat(2, 1, 1),
+                    build_rotation(split_world_rotation).repeat(2, 1, 1),
                     samples.unsqueeze(-1),
                 ).squeeze(-1)
-                uv_parts.append(self._uv[split_mask].repeat(2, 1) + delta[:, :2])
-                d_parts.append(self._d[split_mask].repeat(2, 1) + delta[:, 2:3])
+                split_uv, split_d = self._offset_uvd_by_world_delta(
+                    self._uv[split_mask].repeat(2, 1),
+                    self._d[split_mask].repeat(2, 1),
+                    split_faces.repeat(2),
+                    delta,
+                    vertices,
+                    normals,
+                )
+                uv_parts.append(split_uv)
+                d_parts.append(split_d)
                 dc_parts.append(self._features_dc[split_mask].repeat(2, 1, 1))
                 rest_parts.append(self._features_rest[split_mask].repeat(2, 1, 1))
                 opacity_parts.append(self._opacity[split_mask].repeat(2, 1))
                 scaling_parts.append(
-                    (self.get_scaling[split_mask].repeat(2, 1) / 1.6).log()
+                    self._scaling[split_mask].repeat(2, 1) - math.log(1.6)
                 )
                 rotation_parts.append(self._rotation[split_mask].repeat(2, 1))
                 face_parts.append(self._face_idx[split_mask].repeat(2))
@@ -1440,7 +1536,31 @@ class GaussianFlameUVModel(GaussianModel):
             )
             if split:
                 self.prune_points(split_parents)
+                if post_protected_mask is not None:
+                    post_protected_mask = post_protected_mask[
+                        ~split_parents
+                    ]
             assert self.num_gs == original_count + cloned + split
+            protected_mask = post_protected_mask
+
+        # Match AnimPortrait3D's full-stage ordering: densification resets
+        # max_radii2D before the immediately following prune.  Pruning first
+        # would apply the historical maximum screen radius and remove the
+        # large splats that still provide essential silhouette coverage.
+        opacity = self.get_opacity.squeeze(-1)
+        prune = opacity < min_opacity
+        if max_screen_size is not None:
+            prune |= self.max_radii2D > float(max_screen_size)
+        if protected_mask is not None:
+            if protected_mask.numel() != self.num_gs:
+                raise ValueError(
+                    "Post-densification protected mask has the wrong number "
+                    "of Gaussians"
+                )
+            prune &= ~protected_mask
+        pruned = int(prune.sum().item())
+        if prune.any():
+            self.prune_points(prune)
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

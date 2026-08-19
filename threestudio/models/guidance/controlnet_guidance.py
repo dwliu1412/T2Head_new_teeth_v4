@@ -119,11 +119,11 @@ class ControlNetGuidance(BaseObject):
         # explicitly enable coupled timesteps/noise for its SDS ablation.
         coupled_apply_to_sds: bool = False
 
-        # UVD-consistent ISM (kept behind the historical ``uvd-sfd`` CLI
-        # label for experiment compatibility).  The caller supplies one
-        # visible canonical (semantic layer, u, v, d) coordinate per pixel.
-        # The ordinary AnimPortrait3D ISM objective is unchanged; only its
-        # per-step Gaussian noise is coupled through canonical UVD cells.
+        # UVD-SFD with CFD-consistent noise.  The caller supplies one visible
+        # canonical (semantic layer, u, v, d) coordinate per pixel.  One
+        # canonical Gaussian draw is used to construct both x_t and x_s
+        # directly before taking the ISM-style conditional/null score
+        # difference.
         use_uvd_surface_flow: bool = False
         uvd_flow_noise_seed: int = 0
         uvd_flow_uv_resolution: int = 256
@@ -336,7 +336,7 @@ class ControlNetGuidance(BaseObject):
             self._setup_vsd_lora()
 
         enabled_distillation = {
-            "UVD-consistent ISM": bool(self.cfg.use_uvd_surface_flow),
+            "UVD-SFD": bool(self.cfg.use_uvd_surface_flow),
             "VSD": bool(self.cfg.use_vsd),
             "ISM": bool(self.cfg.use_ism),
             "NFSD/DSD": bool(self.cfg.use_nfsd or self.cfg.use_dsd),
@@ -344,7 +344,7 @@ class ControlNetGuidance(BaseObject):
         selected = [name for name, enabled in enabled_distillation.items() if enabled]
         if len(selected) > 1:
             raise ValueError(
-                "UVD-consistent ISM, VSD, ISM, and NFSD/DSD are mutually "
+                "UVD-SFD, VSD, ISM, and NFSD/DSD are mutually "
                 "exclusive guidance "
                 f"branches, got {selected}."
             )
@@ -356,7 +356,7 @@ class ControlNetGuidance(BaseObject):
             ).lower()
             if prediction_type != "epsilon":
                 raise ValueError(
-                    "UVD-consistent ISM requires an epsilon-prediction "
+                    "UVD-SFD requires an epsilon-prediction "
                     "diffusion teacher; "
                     f"scheduler prediction_type={prediction_type!r}"
                 )
@@ -393,16 +393,15 @@ class ControlNetGuidance(BaseObject):
     def _setup_uvd_surface_flow(self) -> None:
         if str(self.cfg.ism_variant).strip().lower() != "animportrait3d":
             raise ValueError(
-                "UVD-consistent ISM requires "
-                "ism_variant='animportrait3d' so only the noise coupling "
-                "differs from the reference ISM ablation"
+                "UVD-SFD requires ism_variant='animportrait3d' to reuse the "
+                "reference ISM timestep-pair schedule and prompt layout"
             )
         minimum_distinct_cells = int(self.cfg.uvd_flow_min_distinct_cells)
         if minimum_distinct_cells < 1:
             raise ValueError("uvd_flow_min_distinct_cells must be positive")
         if bool(self.cfg.coupled_mean_grad):
             raise ValueError(
-                "UVD-consistent ISM cannot average gradients at matching "
+                "UVD-SFD cannot average gradients at matching "
                 "screen pixels; "
                 "cross-view coupling is defined only by canonical UVD cells"
             )
@@ -414,7 +413,7 @@ class ControlNetGuidance(BaseObject):
             device=self.device,
         )
         threestudio.info(
-            "[UVD-consistent ISM] Initialized canonical semantic UVD noise "
+            "[UVD-SFD] Initialized canonical semantic UVD noise "
             "volume "
             f"L={int(self.cfg.uvd_flow_surface_layers)}, "
             f"D={int(self.cfg.uvd_flow_depth_resolution)}, "
@@ -570,11 +569,11 @@ class ControlNetGuidance(BaseObject):
     def load_uvd_flow_checkpoint_state(
         self, state: Mapping[str, Any]
     ) -> None:
-        """Restore the UVD-ISM per-step volume and private RNGs."""
+        """Restore the UVD-SFD per-step volume and private RNGs."""
 
         if not self.cfg.use_uvd_surface_flow:
             raise RuntimeError(
-                "Cannot restore UVD-consistent ISM state because "
+                "Cannot restore UVD-SFD noise state because "
                 "use_uvd_surface_flow is disabled"
             )
         self.uvd_flow_noise = UVDNoiseVolume(
@@ -596,7 +595,7 @@ class ControlNetGuidance(BaseObject):
     ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         if self.uvd_flow_noise is None:
             raise RuntimeError(
-                "UVD-consistent ISM noise state has not been initialized"
+                "UVD-SFD noise state has not been initialized"
             )
         self.uvd_flow_noise.resample_for_step(step)
         return self.uvd_flow_noise.sample(
@@ -1338,6 +1337,112 @@ class ControlNetGuidance(BaseObject):
         weight = ((1.0 - alpha_prod_t) / alpha_prod_t).sqrt()
         return weight * (noise_pred - target_epsilon)
 
+    def _compute_grad_uvd_sfd(
+            self,
+            text_embeddings: Float[Tensor, "BB 77 768"],
+            latents: Float[Tensor, "B 4 64 64"],
+            image_cond: Float[Tensor, "B C 512 512"],
+            t: Int[Tensor, "B"],
+            noise: Float[Tensor, "B 4 64 64"],
+            step: int = -1,
+            use_control: bool = True,
+    ) -> Float[Tensor, "B 4 64 64"]:
+        """CFD-consistent noise with an ISM-style score difference.
+
+        Unlike AnimPortrait3D ISM, this path performs no DDIM inversion.  The
+        same canonically transported noise ``xi`` constructs both endpoints
+        of the interval directly:
+
+            x_t = alpha_t * x + sigma_t * xi
+            x_s = alpha_s * x + sigma_s * xi
+
+        The returned direction is the text-guided score at ``(x_t, t)`` minus
+        the null-prompt score at ``(x_s, s)``.  It is deliberately unweighted;
+        this is the UVD-SFD direction itself, not the weighted raw-ISM target.
+        """
+
+        batch_size = latents.shape[0]
+        if text_embeddings.shape[0] != batch_size * 3:
+            raise ValueError(
+                "UVD-SFD expects positive, negative and null text embeddings "
+                f"(3B), got {text_embeddings.shape[0]} for B={batch_size}"
+            )
+        if noise is None:
+            raise ValueError("UVD-SFD requires explicit CFD-consistent noise")
+        if noise.shape != latents.shape:
+            raise ValueError(
+                "UVD-SFD noise must have the same shape as the latents, got "
+                f"{tuple(noise.shape)} and {tuple(latents.shape)}"
+            )
+
+        positive = text_embeddings[:batch_size]
+        negative = text_embeddings[batch_size:2 * batch_size]
+        null = text_embeddings[2 * batch_size:3 * batch_size]
+
+        # Keep the same t/s interval used by the AnimPortrait3D ISM ablation:
+        # 100 steps initially, linearly annealed to 50 over 400 optimizer
+        # steps.  Only the construction of the paired noisy latents changes.
+        effective_step = max(int(step), 0)
+        warmup_rate = 1.0 - min(effective_step / 400.0, 1.0)
+        current_delta = int(50 + math.ceil(warmup_rate * (100 - 50)))
+        s = torch.clamp(t - current_delta, min=0)
+
+        with torch.no_grad():
+            # scheduler.add_noise implements sqrt(alpha_bar) * x plus
+            # sqrt(1 - alpha_bar) * noise.  Reusing the exact same ``noise``
+            # tensor here is the CFD consistency constraint.
+            latents_t = self.scheduler.add_noise(latents, noise, t)
+            latents_s = self.scheduler.add_noise(latents, noise, s)
+
+            # epsilon_phi(x_t, t, y): preserve the existing negative-prompt
+            # CFG realization of the text-conditioned score.
+            score_t_raw = self._predict_ism_noise(
+                torch.cat([latents_t, latents_t], dim=0),
+                torch.cat([t, t], dim=0),
+                torch.cat([negative, positive], dim=0),
+                torch.cat([image_cond, image_cond], dim=0),
+                use_control,
+            )
+            score_negative_t, score_positive_t = score_t_raw.chunk(2)
+            score_t = score_negative_t + float(self.cfg.guidance_scale) * (
+                score_positive_t - score_negative_t
+            )
+
+            # epsilon_phi(x_s, s, empty): the lower-noise endpoint uses only
+            # the null prompt, matching the ISM-style score difference.
+            score_s = self._predict_ism_noise(
+                latents_s,
+                s,
+                null,
+                image_cond,
+                use_control,
+            )
+
+        return score_t - score_s
+
+    def compute_grad_uvd_sfd(
+            self,
+            text_embeddings: Float[Tensor, "BB 77 768"],
+            latents: Float[Tensor, "B 4 64 64"],
+            image_cond: Float[Tensor, "B C 512 512"],
+            t: Int[Tensor, "B"],
+            noise: Float[Tensor, "B 4 64 64"],
+            step: int = -1,
+            use_control: bool = True,
+    ) -> Float[Tensor, "B 4 64 64"]:
+        """Return the dedicated UVD-SFD gradient direction."""
+
+        self._set_lora_scale(0.0)
+        return self._compute_grad_uvd_sfd(
+            text_embeddings,
+            latents,
+            image_cond,
+            t,
+            noise=noise,
+            step=step,
+            use_control=use_control,
+        )
+
     def compute_grad_ism(
             self,
             text_embeddings: Float[Tensor, "BB 77 768"],
@@ -1582,9 +1687,9 @@ class ControlNetGuidance(BaseObject):
                 rgb_BCHW, (512, 512), mode="bilinear", align_corners=False
             )
             # encode image into latents with vae
-            # Keep AnimPortrait3D's stochastic VAE encoding in both ISM
-            # ablations.  UVD consistency changes only the diffusion noise,
-            # so the comparison does not silently change a second variable.
+            # Keep AnimPortrait3D's stochastic VAE encoding in both first-
+            # phase ablations so the UVD-SFD objective does not silently
+            # change an unrelated variable as well.
             latents = self.encode_images(rgb_BCHW_512)
 
         # image_cond = control_image
@@ -1664,12 +1769,12 @@ class ControlNetGuidance(BaseObject):
         if uvd_flow_active:
             if global_step < 0 or self.uvd_flow_noise is None:
                 raise RuntimeError(
-                    "UVD-consistent ISM requires a non-negative optimizer "
+                    "UVD-SFD requires a non-negative optimizer "
                     "step and an initialized UVD noise volume"
                 )
             if not bool(torch.all(t == t[0]).item()):
                 raise ValueError(
-                    "Every view and region in a UVD-consistent ISM step must "
+                    "Every view and region in a UVD-SFD step must "
                     "share one timestep"
                 )
         if edit_image:
@@ -1772,8 +1877,8 @@ class ControlNetGuidance(BaseObject):
             "vsd_lora_grad_norm": torch.zeros((), device=self.device),
         }
         uvd_flow_metrics = {
-            "uvd_ism_enabled": torch.zeros((), device=self.device),
-            "uvd_ism_timestep": torch.zeros((), device=self.device),
+            "uvd_sfd_enabled": torch.zeros((), device=self.device),
+            "uvd_sfd_timestep": torch.zeros((), device=self.device),
             "uvd_flow_noise_mean": torch.zeros((), device=self.device),
             "uvd_flow_noise_std": torch.zeros((), device=self.device),
             "uvd_flow_surface_fraction": torch.zeros((), device=self.device),
@@ -1783,7 +1888,7 @@ class ControlNetGuidance(BaseObject):
             "uvd_flow_transport_reliability": torch.zeros(
                 (), device=self.device
             ),
-            "uvd_ism_grad_norm": torch.zeros((), device=self.device),
+            "uvd_sfd_grad_norm": torch.zeros((), device=self.device),
         }
         if (
             not uvd_flow_active
@@ -1803,7 +1908,7 @@ class ControlNetGuidance(BaseObject):
                 or surface_confidence is None
             ):
                 raise ValueError(
-                    "UVD-consistent ISM requires surface UVD, semantic "
+                    "UVD-SFD requires surface UVD, semantic "
                     "layer, and "
                     "correspondence confidence from the differentiable renderer"
                 )
@@ -1831,14 +1936,15 @@ class ControlNetGuidance(BaseObject):
             if not bool(torch.isfinite(uvd_noise).all().item()):
                 raise ValueError("Canonical UVD noise contains non-finite values")
             uvd_flow_metrics.update(sampled_metrics)
-            uvd_flow_metrics["uvd_ism_enabled"] = torch.ones(
+            uvd_flow_metrics["uvd_sfd_enabled"] = torch.ones(
                 (), device=self.device
             )
-            uvd_flow_metrics["uvd_ism_timestep"] = t.float().mean()
-            # This is the exact same AnimPortrait3D null-prompt inversion
-            # objective as the raw ISM branch below.  Canonically transported
-            # noise is the only changed input.
-            grad = self.compute_grad_ism(
+            uvd_flow_metrics["uvd_sfd_timestep"] = t.float().mean()
+            # Construct x_t and x_s directly from the same canonically
+            # transported CFD noise, then subtract the null score at s from
+            # the text-guided score at t.  The raw ISM branch below retains
+            # its original DDIM-inversion objective.
+            grad = self.compute_grad_uvd_sfd(
                 text_embeddings,
                 latents,
                 image_cond,
@@ -1847,7 +1953,7 @@ class ControlNetGuidance(BaseObject):
                 step=global_step,
                 use_control=bool(kwargs.get("use_control", True)),
             )
-            uvd_flow_metrics["uvd_ism_grad_norm"] = self._safe_norm(grad)
+            uvd_flow_metrics["uvd_sfd_grad_norm"] = self._safe_norm(grad)
         elif vsd_active:
             grad, vsd_metrics = self.compute_grad_vsd(
                 text_embeddings,
@@ -1951,7 +2057,7 @@ class ControlNetGuidance(BaseObject):
         guidance_out = {
             "loss_sds": loss_sds,
             "loss_vsd": loss_sds if vsd_active else torch.zeros((), device=self.device),
-            "loss_uvd_consistent_ism": loss_sds
+            "loss_uvd_sfd": loss_sds
             if uvd_flow_active
             else torch.zeros((), device=self.device),
             "grad_norm": grad.norm(),

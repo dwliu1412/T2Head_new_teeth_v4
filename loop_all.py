@@ -447,7 +447,7 @@ class Trainer:
         self.size_threshold_fix_step = cfg['avatar']['size_threshold_fix_step']
         self.max_grad = cfg['avatar']['max_grad']
 
-        diffusion_path = '../HeadStudio_lib/realistic-vision-51'
+        # diffusion_path = '../HeadStudio_lib/realistic-vision-51'
         diffusion_path = '../../others/AnimPortrait3D/pretrained_model/Realistic_Vision_V5.1_noVAE'
         vae_path = '../HeadStudio_lib/sd-vae-ft-mse'
         controlnet_path = '../HeadStudio_lib/ControlNetMediaPipeFace'
@@ -537,30 +537,13 @@ class Trainer:
 
                 self.avatar.set_pose(expression=expression, jaw_pose=jaw_pose, neck_pose=neck_pose, leye_pose=leye_pose, reye_pose=reye_pose)
                 pred_img, _, _, _ = self.avatar.render(dist, elev, azim)
-                # cv2.imwrite(r'cur.png', pred_img.detach().cpu().numpy()[..., [2, 1, 0]] * 255)
+
                 mesh = self.avatar.get_flame_cond(dist, elev, azim, 70.0, expression, jaw_pose, neck_pose, leye_pose, reye_pose)[0]
-                # mouth_mask = get_mouth_mask(self.avatar, dist, elev, azim, 1024, 1024)
-                img = pred_img.permute(2, 0, 1).unsqueeze(0)
-                flame_cond = mesh.permute(2, 0, 1).unsqueeze(0).to(device)
-                imgs = []
 
                 original_image = (torch.clamp(pred_img, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
                 original_image = Image.fromarray(original_image).resize((512, 512))
                 controlnet_conditioning_image = (torch.clamp(mesh, min=0, max=1.0) * 255).byte().contiguous().cpu().numpy()
                 controlnet_conditioning_image = Image.fromarray(controlnet_conditioning_image)
-
-                refined_image_nocontrol = self.sdeditpipeline(
-                    controlnet = None,
-                    prompt= 'a DSLR portrait of a handsome young brown lightly wavy Pompadour with fade, muscled sportsman in navy satin large pinstripe double-breasted suit, pompadour haircut',
-                    negative_prompt='oversaturation, low-resolution, unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull',
-                    image=original_image,
-                    controlnet_conditioning_image=None,
-                    width=original_image.size[0],
-                    height=original_image.size[1],
-                    strength=0.3, 
-                    num_inference_steps=50, 
-                    guidance_scale =7.5,
-                ).images[0].resize((512, 512))
 
                 refined_image = self.sdeditpipeline(
                     controlnet = self.controlnet,
@@ -572,44 +555,16 @@ class Trainer:
                     height=original_image.size[1],
                     strength=0.3, 
                     num_inference_steps=50, 
-                    guidance_scale =7.5,
+                    guidance_scale =6.,
                     controlnet_conditioning_scale=0.65,
                     controlnet_guidance_start=0.0,
                     controlnet_guidance_end=0.55,
                 ).images[0].resize((512, 512))
 
-                original_image.save('cur.png')
-                controlnet_conditioning_image.save('controlnet_conditioning_image.png')
-                refined_image_nocontrol.save('refined_nocontrol.png')
-                refined_image.save('refined.png')
-
-                g = torch.Generator(device=self.device)
                 idx_int = int(idx_t.detach().cpu().item())
-                seed = idx_int
-                g.manual_seed(seed)
-                noise = torch.randn(1, 4, 128, 128, generator=g, device=self.device)
-                fine_img = self.sd.denoise_img(self.guidance, img, flame_cond, self.cfg['paths']['config_path'], noise, elev, azim, dist)
-                # cv2.imwrite('fine_img.png', fine_img[..., [2, 1, 0]])
-                # import pdb;
-                # pdb.set_trace()
-                imgs.append(fine_img.astype(np.float32) / 255.0)
-
-                stack = np.stack(imgs, axis=0)
-                mean, var = stack.mean(axis=0), stack.var(axis=0)
-                # unc = var.mean(axis=-1)
-                # conf = np.exp(-unc / max(tau, 1e-8)).clip(0.0, 1.0).astype(np.float16)
 
                 out_path = os.path.join(path, f"{idx_int:06d}.png")
-                mean_u8 = (mean.clip(0, 1) * 255.0).astype(np.uint8)
-                azim_val = azim.detach().cpu().item()
-                # 计算与正脸（90度）的最小夹角
-                angle_diff = abs((azim_val - 90.0 + 180.0) % 360.0 - 180.0)
-                if angle_diff > 90.0:
-                    foreground_u8 = mean_u8
-                else:
-                    foreground_u8 = self._apply_modnet_mask(mean_u8)
-
-                imageio.imwrite(out_path, foreground_u8)
+                refined_image.save(out_path)
 
         self.train_loader.dataset.switch_image_path(path)
 
@@ -632,14 +587,6 @@ class Trainer:
 
                 self.avatar.set_pose(expression=expression, jaw_pose=jaw_pose, neck_pose=neck_pose, leye_pose=leye_pose, reye_pose=reye_pose)
                 pred_img, viewspace_point_tensor, radii, alpha = self.avatar.render(dist, elev, azim)
-                # uv_img = self.avatar.render_uv(dist, elev, azim)
-                # w_mask = get_lip_weight_mask(self.avatar, dist, elev, azim, pred_img.shape[0], pred_img.shape[1],
-                #                              mouth_weight=2.0)
-                # mouth_mask = get_mouth_mask(self.avatar, dist, elev, azim, 1024, 1024)
-
-                # mouth_masks.append(mouth_mask)
-                # weight_masks.append(w_mask)
-                # uv_renders.append(uv_img)
                 preds_alpha.append(alpha)
                 preds.append(pred_img.permute(2, 0, 1))
                 self.viewspace_point_list.append(viewspace_point_tensor)

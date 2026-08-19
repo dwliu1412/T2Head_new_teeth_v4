@@ -86,10 +86,10 @@ def test_refinement_configs_keep_the_repaired_precision_and_camera_ranges():
         full["system"]["optimization"]["ism_accumulate_grad_batches"]
         == 3
     )
-    assert full["system"]["optimization"]["feature_lr"] == 3.75e-3
-    assert full["system"]["optimization"]["opacity_lr"] == 7.5e-2
+    assert full["system"]["optimization"]["feature_lr"] == 3.75e-4
+    assert full["system"]["optimization"]["opacity_lr"] == 7.5e-3
     assert full["system"]["optimization"]["uv_lr"] == 2.985e-5
-    assert full["system"]["optimization"]["scale_lr"] == 2.55e-2
+    assert full["system"]["optimization"]["scale_lr"] == 2.55e-3
     assert full["system"]["optimization"]["max_grad_norm"] == 0.0
     assert full["system"]["guidance"]["guidance_scale"] == 100.0
     assert full["system"]["guidance"]["control_type"] == "animportrait3d"
@@ -147,6 +147,19 @@ def test_refinement_configs_keep_the_repaired_precision_and_camera_ranges():
     assert full["system"]["sdedit"]["regional_full_crop_loss"] is True
     assert full["system"]["sdedit"]["lpips_net"] == "vgg"
     assert full["system"]["reference_dual_lr"] == 0.0
+    assert full["system"]["scale_stability"] == {
+        "enabled": True,
+        "hard_max_world_scale": 0.05,
+        "max_world_anisotropy": 30.0,
+        "world_anisotropy_weight": 1.0e4,
+        "reference_growth_limit": 1.5,
+        "reference_growth_weight": 1.0e4,
+        "reference_anisotropy_growth_limit": 1.5,
+        "reference_anisotropy_weight": 1.0e4,
+        "mask_regions_to_reference": True,
+    }
+    assert full["system"]["max_world_scale"] == 0.05
+    assert full["system"]["densification"]["enabled"] is False
     assert full["system"]["densification"]["steps"] == [50, 100]
     assert full["system"]["full_protection"] == {
         "enabled": True,
@@ -155,6 +168,14 @@ def test_refinement_configs_keep_the_repaired_precision_and_camera_ranges():
         "freeze_dental": True,
         "protect_from_densification": True,
         "mask_face_loss": True,
+        "mouth_screen_preservation": {
+            "enabled": True,
+            "dilation": 12,
+            "rgb_weight": 100.0,
+            "alpha_weight": 50.0,
+            "depth_weight": 10.0,
+            "alpha_threshold": 0.05,
+        },
     }
     assert full["system"]["regional_guidance"]["abstract_prompt"] == (
         "a photorealistic human face with natural skin, eyes, lips and teeth"
@@ -191,7 +212,7 @@ def test_guidance_mode_switch_preserves_ism_as_an_explicit_ablation():
     assert not any("injection" in value for value in flow)
 
 
-def test_guidance_checkpoint_signature_records_uvd_coupling_only():
+def test_guidance_checkpoint_signature_records_uvd_sfd_objective():
     raw = SimpleNamespace(uvd_flow_enabled=False)
     uvd = SimpleNamespace(
         uvd_flow_enabled=True,
@@ -224,12 +245,38 @@ def test_guidance_checkpoint_signature_records_uvd_coupling_only():
 
     assert raw_signature == {"mode": "ism"}
     assert uvd_signature["mode"] == "uvd-sfd"
+    assert uvd_signature["objective"] == {
+        "name": "cfd-consistent-score-difference",
+        "version": 1,
+        "t_score": "negative-prompt-cfg",
+        "s_score": "null-prompt",
+        "weighting": "none",
+        "interval": "animportrait3d-annealed-100-to-50",
+    }
     assert uvd_signature["noise"]["seed"] == 13
     assert uvd_signature["noise"]["uv_resolution"] == 512
     assert uvd_signature["correspondence"]["d_range"] is None
 
+    former_ddim_objective = dict(uvd_signature)
+    former_ddim_objective.pop("objective")
+    validator = SimpleNamespace(
+        _guidance_method_signature=lambda: uvd_signature
+    )
+    try:
+        Head3DGSLKsReconstructionFinetune._validate_guidance_checkpoint_method(
+            validator,
+            {
+                "stage2_guidance_method": former_ddim_objective,
+                "stage2_uvd_ism_noise": {},
+            },
+        )
+    except ValueError as error:
+        assert "guidance method differs" in str(error)
+    else:
+        raise AssertionError("Former UVD DDIM objective was resumable")
 
-def test_uvd_ism_uses_the_same_negative_prompt_as_raw_ism():
+
+def test_uvd_sfd_uses_the_configured_negative_prompt_for_t_cfg():
     system = SimpleNamespace(
         cfg=SimpleNamespace(
             prompt="a portrait",
@@ -376,7 +423,65 @@ def test_animportrait3d_ism_uses_the_explicit_noise_in_its_inversion():
     )
 
 
-def test_uvd_mode_dispatches_to_the_same_ism_with_canonical_noise():
+def test_uvd_sfd_constructs_both_endpoints_from_the_same_cfd_noise():
+    explicit_noise = torch.randn(1, 4, 2, 2)
+    latents = torch.randn_like(explicit_noise)
+    add_noise_calls = []
+    prediction_calls = []
+
+    def add_noise(clean, noise, timestep):
+        add_noise_calls.append((clean, noise, timestep.clone()))
+        return clean + noise + timestep[:, None, None, None].to(clean) / 1000.0
+
+    def predict(sample, timestep, embeddings, image_cond, use_control):
+        prediction_calls.append(
+            (sample.clone(), timestep.clone(), embeddings.clone(), use_control)
+        )
+        if sample.shape[0] == 2:
+            return torch.cat(
+                (
+                    torch.full_like(sample[:1], 2.0),
+                    torch.full_like(sample[:1], 5.0),
+                )
+            )
+        return torch.full_like(sample, 3.0)
+
+    guidance = SimpleNamespace(
+        cfg=SimpleNamespace(guidance_scale=4.0),
+        scheduler=SimpleNamespace(add_noise=add_noise),
+        _predict_ism_noise=predict,
+    )
+    embeddings = torch.tensor([10.0, 20.0, 30.0]).reshape(3, 1, 1)
+    gradient = ControlNetGuidance._compute_grad_uvd_sfd(
+        guidance,
+        embeddings,
+        latents,
+        torch.zeros(1, 4, 4, 4),
+        torch.tensor([300]),
+        noise=explicit_noise,
+        step=400,
+        use_control=False,
+    )
+
+    assert len(add_noise_calls) == 2
+    assert add_noise_calls[0][0] is latents
+    assert add_noise_calls[1][0] is latents
+    assert add_noise_calls[0][1] is explicit_noise
+    assert add_noise_calls[1][1] is explicit_noise
+    assert add_noise_calls[0][2].tolist() == [300]
+    assert add_noise_calls[1][2].tolist() == [250]
+    assert len(prediction_calls) == 2
+    assert prediction_calls[0][1].tolist() == [300, 300]
+    assert prediction_calls[0][2].flatten().tolist() == [20.0, 10.0]
+    assert prediction_calls[1][1].tolist() == [250]
+    assert prediction_calls[1][2].flatten().tolist() == [30.0]
+    assert all(not call[3] for call in prediction_calls)
+    # CFG at t: 2 + 4 * (5 - 2) = 14; null score at s: 3.  UVD-SFD
+    # returns the unweighted score difference exactly.
+    torch.testing.assert_close(gradient, torch.full_like(gradient, 11.0))
+
+
+def test_uvd_mode_dispatches_to_uvd_sfd_with_canonical_noise():
     canonical_noise = torch.randn(1, 4, 64, 64)
     calls = {}
 
@@ -387,7 +492,7 @@ def test_uvd_mode_dispatches_to_the_same_ism_with_canonical_noise():
         def get_text_embeddings(*_args, **_kwargs):
             return torch.zeros(3, 1, 1)
 
-    def compute_ism(
+    def compute_uvd_sfd(
         text_embeddings,
         latents,
         image_cond,
@@ -433,7 +538,7 @@ def test_uvd_mode_dispatches_to_the_same_ism_with_canonical_noise():
                 {"uvd_flow_transport_reliability": torch.tensor(1.0)},
             )
         ),
-        compute_grad_ism=compute_ism,
+        compute_grad_uvd_sfd=compute_uvd_sfd,
         _safe_norm=lambda value: value.norm(),
     )
     result = ControlNetGuidance.__call__(
@@ -456,7 +561,7 @@ def test_uvd_mode_dispatches_to_the_same_ism_with_canonical_noise():
     assert calls["step"] == 7
     assert calls["timestep"].tolist() == [300]
     assert calls["use_control"] is False
-    assert result["loss_uvd_consistent_ism"].item() == 0.0
+    assert result["loss_uvd_sfd"].item() == 0.0
 
     guidance._uvd_flow_noise_from_surface = (
         lambda *_args, **_kwargs: (
@@ -838,12 +943,13 @@ def load_tests(
         test_mouth_entrypoint_adds_reference_region_prefix_once,
         test_refinement_configs_keep_the_repaired_precision_and_camera_ranges,
         test_guidance_mode_switch_preserves_ism_as_an_explicit_ablation,
-        test_guidance_checkpoint_signature_records_uvd_coupling_only,
-        test_uvd_ism_uses_the_same_negative_prompt_as_raw_ism,
+        test_guidance_checkpoint_signature_records_uvd_sfd_objective,
+        test_uvd_sfd_uses_the_configured_negative_prompt_for_t_cfg,
         test_uvd_correspondence_reuses_the_exact_rgb_crop_plan,
         test_uvd_variance_rejection_never_falls_through_to_a_rear_layer,
         test_animportrait3d_ism_uses_the_explicit_noise_in_its_inversion,
-        test_uvd_mode_dispatches_to_the_same_ism_with_canonical_noise,
+        test_uvd_sfd_constructs_both_endpoints_from_the_same_cfd_noise,
+        test_uvd_mode_dispatches_to_uvd_sfd_with_canonical_noise,
         test_uvd_mode_requires_the_animportrait3d_ism_variant,
         test_uvd_and_raw_ism_use_the_same_adam_learning_rate,
         test_first_phase_artifacts_are_named_and_written_exactly_once,

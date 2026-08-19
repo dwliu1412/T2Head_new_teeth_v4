@@ -32,12 +32,30 @@ def render(
     Background tensor (bg_color) must be on GPU!
     """
     cov3D_precomp = None
+    scales = None
+    rotations = None
     if precomputed_geometry is not None:
-        if not isinstance(precomputed_geometry, (tuple, list)) or len(precomputed_geometry) != 2:
-            raise ValueError("precomputed_geometry must be a (means3D, packed_covariance) pair")
-        means3D, cov3D_precomp = precomputed_geometry
+        if not isinstance(precomputed_geometry, (tuple, list)):
+            raise ValueError("precomputed_geometry must be a tuple or list")
+        if len(precomputed_geometry) == 2:
+            means3D, cov3D_precomp = precomputed_geometry
+        elif len(precomputed_geometry) == 3:
+            means3D, scales, rotations = precomputed_geometry
+        else:
+            raise ValueError(
+                "precomputed_geometry must be (means3D, packed_covariance) "
+                "or (means3D, scales, rotations)"
+            )
     elif hasattr(pc, "get_deformed_gaussians"):
-        means3D, cov3D_precomp = pc.get_deformed_gaussians(scaling_modifier)
+        deformed = pc.get_deformed_gaussians(scaling_modifier)
+        if len(deformed) == 2:
+            means3D, cov3D_precomp = deformed
+        elif len(deformed) == 3:
+            means3D, scales, rotations = deformed
+        else:
+            raise ValueError(
+                "get_deformed_gaussians() must return two or three tensors"
+            )
     else:
         means3D = pc.get_xyz
 
@@ -74,17 +92,16 @@ def render(
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
     must_precompute = bool(
         getattr(pc, "requires_precomputed_covariance", False) or cov3D_precomp is not None
     )
-    if pipe.compute_cov3D_python or must_precompute:
-        if cov3D_precomp is None:
-            cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+    if scales is None:
+        if pipe.compute_cov3D_python or must_precompute:
+            if cov3D_precomp is None:
+                cov3D_precomp = pc.get_covariance(scaling_modifier)
+        else:
+            scales = pc.get_scaling
+            rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.

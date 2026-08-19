@@ -1,9 +1,13 @@
-"""Pose-envelope covariance stabilization for FLAME-bound UVD Gaussians.
+"""Pose-envelope covariance stabilization for FLAME-bound Gaussians.
 
-The canonical covariance of a UVD Gaussian is pushed to a posed world frame
-by the local surface Jacobian ``J``::
+For the current representation, a face-local covariance is mapped by the
+posed face transform ``A = k R_face``::
 
-    C_world = J @ C_uvd @ J.T
+    C_world = A @ C_face @ A.T
+
+There is no UVD derivative in that transform.  The low-level helpers retain
+their historical ``jacobian`` argument name so existing CPU-only tests and
+legacy callers can pass any invertible linear covariance transform.
 
 This module detects streaks from the *two largest* world-space standard
 deviations, ``s0 >= s1 >= s2``.  In particular, it deliberately uses
@@ -11,13 +15,15 @@ deviations, ``s0 >= s1 >= s2``.  In particular, it deliberately uses
 very small normal-axis scale ``s2`` without being a long in-plane streak.
 
 The tensor helpers are CPU-safe and do not import the FLAME or CUDA extension
-stack.  :func:`stabilize_uvd_covariances` is the small adapter used with
-``GaussianFlameUVModel``.
+stack.  :func:`stabilize_face_local_covariances` is the small adapter used with
+``GaussianFlameUVModel``.  Its public name is retained for checkpoint/config
+compatibility even though the current model stores face-local ellipsoids.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -375,7 +381,11 @@ def scaling_rotation_from_covariance(
 def pushforward_covariance(
     canonical_covariance: Tensor, jacobian: Tensor
 ) -> Tensor:
-    """Push a UVD covariance through a posed surface Jacobian."""
+    """Push a local covariance through a linear transform.
+
+    ``jacobian`` is the backward-compatible argument name; the face-local
+    model passes ``k R_face`` rather than a derivative.
+    """
 
     _check_matrix_batch(canonical_covariance, "canonical_covariance")
     _check_matrix_batch(jacobian, "jacobian")
@@ -390,7 +400,7 @@ def pushforward_covariance(
 
 
 def pullback_covariance(world_covariance: Tensor, jacobian: Tensor) -> Tensor:
-    """Pull a world covariance back with ``J^{-1} C J^{-T}``."""
+    """Pull a world covariance back through an invertible transform."""
 
     _check_matrix_batch(world_covariance, "world_covariance")
     _check_matrix_batch(jacobian, "jacobian")
@@ -482,7 +492,8 @@ def cap_world_covariance(
     every principal scale of an absolute outlier is clamped to
     ``absolute_cap`` first.
 
-    The repaired world covariance is then pulled back to canonical UVD space.
+    The repaired world covariance is then pulled back to the model's local
+    parameter space.
     """
 
     resolved = _resolve_config(config)
@@ -578,32 +589,33 @@ def _model_value(model: Any, name: str) -> Tensor:
 
 
 def _model_canonical_covariance(model: Any) -> Tensor:
-    scaling = _model_value(model, "get_scaling")
-    rotation = _model_value(model, "get_rotation")
+    scaling_name = (
+        "get_local_scaling"
+        if hasattr(model, "get_local_scaling")
+        else "get_scaling"
+    )
+    rotation_name = (
+        "get_local_rotation"
+        if hasattr(model, "get_local_rotation")
+        else "get_rotation"
+    )
+    scaling = _model_value(model, scaling_name)
+    rotation = _model_value(model, rotation_name)
     return covariance_from_scaling_rotation(scaling, rotation)
 
 
-def _model_current_jacobian(model: Any) -> Tensor:
-    for name in ("current_uvd_jacobian", "get_uvd_jacobian"):
-        method = getattr(model, name, None)
-        if callable(method):
-            jacobian = method()
-            if not isinstance(jacobian, torch.Tensor):
-                raise TypeError(
-                    "model.{}() must return a tensor".format(name)
-                )
-            return jacobian
-
-    flame_geometry = getattr(model, "_flame_verts_and_normals", None)
-    uvd_jacobian = getattr(model, "_uvd_jacobian", None)
-    if not callable(flame_geometry) or not callable(uvd_jacobian):
+def _model_current_transform(model: Any) -> Tensor:
+    face_transform = getattr(model, "current_covariance_transform", None)
+    if not callable(face_transform):
         raise AttributeError(
-            "model must expose current_uvd_jacobian(), "
-            "get_uvd_jacobian(), or GaussianFlameUVModel's private "
-            "FLAME/Jacobian methods"
+            "face-local model must expose current_covariance_transform()"
         )
-    vertices, normals = flame_geometry()
-    return uvd_jacobian(vertices, normals)
+    transform = face_transform()
+    if not isinstance(transform, torch.Tensor):
+        raise TypeError(
+            "model.current_covariance_transform() must return a tensor"
+        )
+    return transform
 
 
 def _write_model_covariance(
@@ -700,6 +712,7 @@ def _scan_pose_envelope(
     named_poses: Sequence[NamedPose],
     set_pose: Callable[[Any], None],
     config: StabilityConfig,
+    world_scale_multiplier: float = 1.0,
 ) -> Dict[str, Any]:
     point_count = int(_model_value(model, "get_scaling").shape[0])
     first_tensor = _model_value(model, "get_scaling")
@@ -717,9 +730,9 @@ def _scan_pose_envelope(
     for label, pose in named_poses:
         set_pose(pose)
         canonical = _model_canonical_covariance(model)
-        jacobian = _model_current_jacobian(model).to(
+        jacobian = _model_current_transform(model).to(
             dtype=canonical.dtype, device=canonical.device
-        )
+        ) * float(world_scale_multiplier)
         scales, _ = world_principal_scales(canonical, jacobian)
         stats, flagged = _scale_statistics(str(label), scales, config)
         absolute, streak, _ = classify_world_scales(scales, config)
@@ -753,12 +766,13 @@ def _scan_pose_envelope(
 
 
 @torch.no_grad()
-def stabilize_uvd_covariances(
+def stabilize_face_local_covariances(
     model: Any,
     named_poses: Sequence[NamedPose],
     set_pose: Callable[[Any], None],
     config: Union[StabilityConfig, Mapping[str, Any]],
     reference_pose: Optional[Any] = None,
+    world_scale_multiplier: float = 1.0,
 ) -> Dict[str, Any]:
     """Stabilize a Gaussian model over a named FLAME-pose envelope.
 
@@ -768,17 +782,24 @@ def stabilize_uvd_covariances(
         set_pose: Callback invoked as ``set_pose(pose)``.
         config: :class:`StabilityConfig` or a compatible mapping.
         reference_pose: Pose restored in ``finally`` after every exit path.
+        world_scale_multiplier: Additional scene-similarity scale applied
+            after the model-local face transform.
 
     Returns:
         A JSON-serializable report containing envelope-wide before/after
         summaries and per-pose statistics for every repair pass.
 
-    The model's canonical covariance is transactionally restored if scanning
+    The model's local covariance is transactionally restored if scanning
     or repair raises.  A successful call only changes ``_scaling`` and
     ``_rotation``.
     """
 
     resolved = _resolve_config(config)
+    world_scale_multiplier = float(world_scale_multiplier)
+    if not math.isfinite(world_scale_multiplier) or (
+        world_scale_multiplier <= 0.0
+    ):
+        raise ValueError("world_scale_multiplier must be finite and positive")
     poses = list(named_poses)
     if not poses:
         raise ValueError("named_poses must contain at least one pose")
@@ -796,6 +817,7 @@ def stabilize_uvd_covariances(
         "pose_labels": [str(label) for label, _ in poses],
         "passes_requested": int(resolved.passes),
         "passes_completed": 0,
+        "world_scale_multiplier": world_scale_multiplier,
         "total_updates": 0,
         "unique_updated": 0,
         "converged": False,
@@ -822,7 +844,11 @@ def stabilize_uvd_covariances(
 
     try:
         report["before"] = _scan_pose_envelope(
-            model, poses, set_pose, resolved
+            model,
+            poses,
+            set_pose,
+            resolved,
+            world_scale_multiplier,
         )
 
         for pass_index in range(resolved.passes):
@@ -833,9 +859,9 @@ def stabilize_uvd_covariances(
             for label, pose in poses:
                 set_pose(pose)
                 canonical = _model_canonical_covariance(model)
-                jacobian = _model_current_jacobian(model).to(
+                jacobian = _model_current_transform(model).to(
                     dtype=canonical.dtype, device=canonical.device
-                )
+                ) * world_scale_multiplier
                 repair = cap_world_covariance(
                     canonical, jacobian, resolved
                 )
@@ -889,7 +915,11 @@ def stabilize_uvd_covariances(
 
         report["unique_updated"] = int(updated_union.sum().item())
         report["after"] = _scan_pose_envelope(
-            model, poses, set_pose, resolved
+            model,
+            poses,
+            set_pose,
+            resolved,
+            world_scale_multiplier,
         )
         report["converged"] = (
             int(report["after"]["flagged_unique"]) == 0
@@ -904,9 +934,10 @@ def stabilize_uvd_covariances(
             set_pose(reference_pose)
 
 
-# A migration-friendly verb for callers that still refer to Stage-0 as
-# "sanitation".  Both names intentionally share one implementation.
-sanitize_uvd_covariances = stabilize_uvd_covariances
+# Migration aliases for old configs/tools.  They intentionally share the
+# face-local implementation and do not restore UVD covariance transport.
+stabilize_uvd_covariances = stabilize_face_local_covariances
+sanitize_uvd_covariances = stabilize_face_local_covariances
 
 
 __all__ = [
@@ -921,6 +952,7 @@ __all__ = [
     "quaternion_to_matrix",
     "sanitize_uvd_covariances",
     "scaling_rotation_from_covariance",
+    "stabilize_face_local_covariances",
     "stabilize_uvd_covariances",
     "world_principal_scales",
 ]

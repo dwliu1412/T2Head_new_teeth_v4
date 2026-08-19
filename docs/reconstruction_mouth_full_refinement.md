@@ -9,8 +9,9 @@
 ```
 
 - `ism`：保留 AnimPortrait3D 的原始 null-prompt DDIM inversion ISM。
-- `uvd-sfd`：为兼容旧实验目录保留的参数名，实际方法已改为
-  UVD-consistent ISM；它只改变 ISM 的噪声联合分布。
+- `uvd-sfd`：使用同一份 CFD/UVD 一致噪声直接构造 `x_t` 与 `x_s`，
+  优化文本条件的 `t` 时刻预测与空提示的 `s` 时刻预测之差；不再执行
+  null-prompt DDIM inversion。
 - `independent`：原始逐视角 SDEdit。
 - `flame-surface`：基于冻结第一阶段表面的多视角一致 SDEdit。
 
@@ -21,14 +22,18 @@
 
 Mouth 阶段从 Stage-1 的 `model/uvd.ply` 和
 `model/reconstruction_params.npz` 初始化，前 500 个 optimizer steps 为
-ISM，后 500 步为 SDEdit。当前配置只更新 dental points；非 dental
+所选 guidance（ISM 或 UVD-SFD），后 500 步为 SDEdit。当前配置只更新 dental points；非 dental
 Gaussian 的梯度和 Adam 动量都被清零。
 
-Full 阶段从完整 mouth 输出继续，前 1000 个 optimizer steps 为 ISM，
+Full 阶段从完整 mouth 输出继续，前 1000 个 optimizer steps 为所选 guidance，
 后 750 步为 SDEdit。当前 `full_protection` 配置冻结 eyes、mouth 和
-dental points；区域 guidance/SDEdit 权重只开启 full 与 face。Full 阶段
-在 optimizer step 50/100 执行 densification，raw ISM 和 UVD-consistent
-ISM 使用完全相同的 topology、学习率与保护规则。
+dental points；区域 guidance/SDEdit 权重只开启 full 与 face。默认保持 mouth
+输出的 topology，不执行 densification；只有显式传入 `--densification-steps`
+才会开启该实验。尺度约束仅使用 aligned world-space scale，不再对随父面大小
+变化的 face-local scale 使用固定阈值。当前 full 将 world 三轴逐轴硬限制在
+`0.05`，并约束每点相对输入 mouth 状态的逐轴增长和轴比增长不超过 `1.5×`；
+scale 学习率为原 GSAvatar full 设置的十分之一，以避免 ISM 在最初几步生成针状
+高斯。
 
 ## 运行
 
@@ -76,14 +81,15 @@ F:\Anaconda3\envs\headstudio\python.exe train_mouth.py `
   --guidance-mode uvd-sfd `
   --sdedit-mode independent `
   --max-steps 10 `
-  --output outputs\smoke\mouth_uvd_ism `
+  --output outputs\smoke\mouth_uvd_sfd `
   --gpu 0
 ```
 
 `--max-steps <= 500`（mouth）或 `<= 1000`（full）时不会进入 SDEdit。
 `--dry-run` 只检查入口、资产和最终命令。每次正式运行必须使用新的
-输出目录；旧 probability-flow UVD-SFD checkpoint 不允许直接恢复。
-ISM/UVD-ISM 的 checkpoint 不能互相续训。SDEdit 则允许从尚未执行任何
+输出目录；旧版 UVD 目标的 checkpoint 不允许直接恢复。
+ISM/UVD-SFD（以及旧版 UVD 目标）的 checkpoint 不能互相续训。SDEdit
+则允许从尚未执行任何
 SDEdit 更新的同一个阶段边界 checkpoint 分叉；一旦第二阶段已有更新，
 再切换 `independent`/`flame-surface` 会被拒绝。
 

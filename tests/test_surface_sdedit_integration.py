@@ -324,8 +324,8 @@ def test_sdedit_capture_freezes_the_discrete_face_binding():
         gaussian=gaussian,
         true_global_step=5,
         _stabilize_current_full_scale=lambda: {
-            "canonical_capped": 0,
             "world_capped": 0,
+            "world_before": 0.0,
         },
     )
 
@@ -335,6 +335,360 @@ def test_sdedit_capture_freezes_the_discrete_face_binding():
 
     assert captured.dtype == torch.long
     assert captured.tolist() == [3, 7]
+
+
+def test_full_geometry_barrier_uses_only_aligned_world_scale():
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=0.08,
+            world_scale_weight=10_000.0,
+            mouth={
+                "max_scale": 0.015,
+                "max_abs_d": 0.002,
+                "barrier_weight": 0.02,
+            },
+        ),
+        dental_point_mask=torch.zeros(2, dtype=torch.bool),
+        gaussian=SimpleNamespace(
+            # A very large face-local scale is valid when the corresponding
+            # FLAME triangle maps it to a small world-space ellipsoid.
+            _scaling=torch.tensor([[13.0, 13.0, 13.0], [0.0, 0.0, 0.0]]),
+            _d=torch.zeros(2, 1),
+        ),
+        _full_scale_stability_enabled=lambda: False,
+    )
+    output = {
+        "scales": torch.tensor(
+            [[0.03, 0.02, 0.01], [0.09, 0.02, 0.01]],
+            dtype=torch.float32,
+        )
+    }
+
+    loss, parts = Head3DGSLKsReconstructionFinetune._geometry_barrier(
+        system, output
+    )
+
+    assert set(parts) == {"world_scale"}
+    assert torch.isclose(loss, torch.tensor(1.0), atol=1.0e-5)
+
+
+def test_reference_world_scale_replaces_only_the_learned_local_axes():
+    current_raw = torch.tensor(
+        [[2.0, 1.0, 0.5]], dtype=torch.float32
+    ).log()
+    initial_raw = torch.tensor(
+        [[1.0, 2.0, 0.25]], dtype=torch.float32
+    ).log()
+    system = SimpleNamespace(
+        gaussian=SimpleNamespace(
+            _scaling=current_raw,
+            scaling_activation=torch.exp,
+        ),
+        initial={"scale": initial_raw},
+    )
+    current_world = torch.tensor(
+        [[0.04, 0.02, 0.01]], requires_grad=True
+    )
+
+    reference = (
+        Head3DGSLKsReconstructionFinetune._reference_world_scales_current_pose(
+            system, current_world
+        )
+    )
+
+    assert torch.allclose(
+        reference, torch.tensor([[0.02, 0.04, 0.005]])
+    )
+    assert not reference.requires_grad
+
+
+def test_full_geometry_barrier_limits_reference_world_growth_and_anisotropy():
+    reference = torch.tensor(
+        [[0.02, 0.02, 0.01], [0.02, 0.01, 0.01], [0.01, 0.01, 0.01]]
+    )
+    current = torch.tensor(
+        [[0.03, 0.02, 0.01], [0.04, 0.01, 0.01], [1.0, 0.001, 0.001]]
+    )
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=2.0,
+            world_scale_weight=1.0,
+            scale_stability={
+                "enabled": True,
+                "reference_growth_limit": 1.5,
+                "reference_growth_weight": 1.0,
+                "reference_anisotropy_growth_limit": 1.5,
+                "reference_anisotropy_weight": 1.0,
+            },
+            mouth={
+                "max_scale": 0.015,
+                "max_abs_d": 0.002,
+                "barrier_weight": 0.02,
+            },
+        ),
+        dental_point_mask=torch.zeros(3, dtype=torch.bool),
+        gaussian=SimpleNamespace(_d=torch.zeros(3, 1)),
+        _full_scale_stability_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: torch.tensor(
+            [True, True, False]
+        ),
+        _reference_world_scales_current_pose=lambda scales: reference,
+    )
+
+    loss, parts = Head3DGSLKsReconstructionFinetune._geometry_barrier(
+        system, {"scales": current}
+    )
+
+    expected_excess = torch.log(torch.tensor(2.0 / 1.5))
+    assert set(parts) == {
+        "world_scale",
+        "world_scale_growth",
+        "world_anisotropy_growth",
+    }
+    assert torch.isclose(
+        loss, 2.0 * expected_excess.square(), atol=1.0e-6
+    )
+
+
+def test_full_hard_cap_uses_world_scale_and_skips_protected_rows():
+    scaling = torch.nn.Parameter(
+        torch.tensor(
+            [[13.0, 13.0, 13.0], [0.0, 0.0, 0.0], [1.0, 1.0, 1.0]]
+        )
+    )
+    world_scales = torch.tensor(
+        [[0.04, 0.03, 0.02], [0.16, 0.08, 0.04], [0.16, 0.08, 0.04]]
+    )
+    cleared = []
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=0.08,
+            scale_stability={"enabled": True, "hard_max_world_scale": 0.08},
+        ),
+        gaussian=SimpleNamespace(_scaling=scaling),
+        _full_scale_stability_enabled=lambda: True,
+        _aligned_render_geometry=lambda: (None, world_scales, None),
+        _full_region_protection_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: torch.tensor(
+            [True, True, False], dtype=torch.bool
+        ),
+        _clear_parameter_optimizer_rows=lambda parameter, mask: cleared.append(
+            (parameter, mask.clone())
+        ),
+    )
+    system._full_world_scale_axis_ratio = lambda scales: (
+        Head3DGSLKsReconstructionFinetune._full_world_scale_axis_ratio(
+            system, scales
+        )
+    )
+
+    count, maximum_before = (
+        Head3DGSLKsReconstructionFinetune._cap_current_full_world_scale(system)
+    )
+
+    assert count == 1
+    assert abs(maximum_before - 0.16) < 1.0e-6
+    assert torch.equal(scaling[0], torch.tensor([13.0, 13.0, 13.0]))
+    assert torch.allclose(
+        scaling[1], torch.tensor([0.5, 1.0, 1.0]).log()
+    )
+    assert torch.equal(scaling[2], torch.tensor([1.0, 1.0, 1.0]))
+    assert len(cleared) == 1
+    assert torch.equal(cleared[0][1], torch.tensor([False, True, False]))
+
+
+def test_full_render_cap_is_per_axis_and_preserves_protected_rows():
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=0.05,
+            scale_stability={"enabled": True, "hard_max_world_scale": 0.05},
+        ),
+        _full_scale_stability_enabled=lambda: True,
+        _full_region_protection_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: torch.tensor([True, False]),
+    )
+    system._full_world_scale_axis_ratio = lambda current: (
+        Head3DGSLKsReconstructionFinetune._full_world_scale_axis_ratio(
+            system, current
+        )
+    )
+    scales = torch.tensor(
+        [[0.10, 0.04, 0.02], [0.10, 0.04, 0.02]], requires_grad=True
+    )
+
+    capped = Head3DGSLKsReconstructionFinetune._cap_full_render_world_scales(
+        system, scales
+    )
+
+    assert torch.allclose(capped[0], torch.tensor([0.05, 0.04, 0.02]))
+    assert torch.equal(capped[1], scales[1])
+
+
+def test_absolute_world_anisotropy_barrier_uses_only_trainable_rows():
+    current = torch.tensor(
+        [[0.03, 0.001, 0.001], [0.03, 0.001, 0.001]],
+        dtype=torch.float32,
+    )
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=0.05,
+            world_scale_weight=0.0,
+            scale_stability={
+                "enabled": True,
+                "max_world_anisotropy": 10.0,
+                "world_anisotropy_weight": 2.0,
+                "reference_growth_weight": 0.0,
+                "reference_anisotropy_weight": 0.0,
+            },
+            mouth={
+                "max_scale": 0.015,
+                "max_abs_d": 0.002,
+                "barrier_weight": 0.02,
+            },
+        ),
+        dental_point_mask=torch.zeros(2, dtype=torch.bool),
+        gaussian=SimpleNamespace(_d=torch.zeros(2, 1)),
+        _full_scale_stability_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: torch.tensor([True, False]),
+        _reference_world_scales_current_pose=lambda scales: scales.detach(),
+    )
+
+    loss, parts = Head3DGSLKsReconstructionFinetune._geometry_barrier(
+        system, {"scales": current}
+    )
+
+    expected = 2.0 * torch.log(torch.tensor(3.0)).square()
+    assert set(parts) == {"world_scale", "world_anisotropy"}
+    assert torch.isclose(loss, expected, atol=1.0e-6)
+
+
+def test_absolute_world_anisotropy_hard_cap_shrinks_only_long_axes():
+    scaling = torch.nn.Parameter(torch.zeros(2, 3))
+    world_scales = torch.tensor(
+        [[0.04, 0.001, 0.001], [0.04, 0.001, 0.001]]
+    )
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            max_world_scale=0.05,
+            scale_stability={
+                "enabled": True,
+                "hard_max_world_scale": 0.05,
+                "max_world_anisotropy": 10.0,
+            },
+        ),
+        gaussian=SimpleNamespace(_scaling=scaling),
+        _full_scale_stability_enabled=lambda: True,
+        _aligned_render_geometry=lambda: (None, world_scales, None),
+        _full_region_protection_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: torch.tensor([True, False]),
+        _clear_parameter_optimizer_rows=lambda *_args: None,
+    )
+    system._full_world_scale_axis_ratio = lambda current: (
+        Head3DGSLKsReconstructionFinetune._full_world_scale_axis_ratio(
+            system, current
+        )
+    )
+
+    count, _ = (
+        Head3DGSLKsReconstructionFinetune._cap_current_full_world_scale(system)
+    )
+
+    assert count == 1
+    assert torch.allclose(
+        scaling[0], torch.tensor([0.25, 1.0, 1.0]).log()
+    )
+    assert torch.equal(scaling[1], torch.zeros(3))
+
+
+def test_full_face_rebinding_receives_only_the_trainable_point_mask():
+    captured = {}
+    trainable = torch.tensor([True, False, False, True])
+    gaussian = SimpleNamespace(
+        _uv=torch.nn.Parameter(torch.zeros(4, 2)),
+        update_face_idx_from_uv=lambda **kwargs: (
+            captured.update(kwargs) or {"updated": 0, "projected": 0}
+        ),
+    )
+    system = SimpleNamespace(
+        gaussian=gaussian,
+        optimization_stage="full",
+        _optimizer_stepped_this_batch=True,
+        true_global_step=1,
+        _last_geometry_projection_step=0,
+        _active_trainable_point_mask=lambda: trainable,
+        _stabilize_current_full_scale=lambda: {
+            "world_capped": 0,
+            "world_before": 0.0,
+        },
+        log=lambda *_args, **_kwargs: None,
+        cfg=SimpleNamespace(reference_dual_lr=0.0),
+        _maybe_write_first_phase_artifacts=lambda: None,
+    )
+
+    Head3DGSLKsReconstructionFinetune.on_train_batch_end(
+        system, None, {}, 0
+    )
+
+    assert captured["return_stats"] is True
+    assert captured["mask"] is trainable
+
+
+def test_mouth_screen_depth_loss_detects_an_occluder_inside_the_mouth():
+    target_rgb = torch.zeros(1, 2, 2, 3)
+    target_alpha = torch.ones(1, 2, 2, 1)
+    target_depth = torch.full((1, 2, 2, 1), 2.0)
+    current_depth = target_depth.clone().requires_grad_(True)
+    current_depth.data[0, 0, 0, 0] = 1.0
+    mouth_mask = torch.zeros(1, 2, 2, 1)
+    mouth_mask[0, 0, 0, 0] = 1.0
+    system = SimpleNamespace(
+        cfg=SimpleNamespace(
+            full_protection={
+                "mouth_screen_preservation": {
+                    "enabled": True,
+                    "dilation": 0,
+                    "rgb_weight": 100.0,
+                    "alpha_weight": 50.0,
+                    "depth_weight": 10.0,
+                    "alpha_threshold": 0.05,
+                }
+            }
+        ),
+        _full_region_protection_enabled=lambda: True,
+        _render_initial_dynamic_reference=lambda _batch: (
+            target_rgb,
+            target_alpha,
+            target_depth,
+        ),
+        _render_point_mask=lambda *_args: mouth_mask,
+        _dilate_mask=lambda mask, _dilation: mask,
+        mouth_guidance_point_mask=torch.ones(1, dtype=torch.bool),
+    )
+    system._masked_smooth_l1 = lambda prediction, target, mask: (
+        Head3DGSLKsReconstructionFinetune._masked_smooth_l1(
+            prediction, target, mask
+        )
+    )
+    output = {
+        "comp_rgb": target_rgb.clone(),
+        "alpha": target_alpha.clone(),
+        "depth": current_depth,
+    }
+
+    loss, parts = (
+        Head3DGSLKsReconstructionFinetune._mouth_screen_preservation_loss(
+            system, {}, output
+        )
+    )
+    loss.backward()
+
+    assert parts["mouth_screen_rgb"].item() == 0.0
+    assert parts["mouth_screen_alpha"].item() == 0.0
+    assert torch.isclose(
+        parts["mouth_screen_depth"], torch.tensor(1.25), atol=1.0e-6
+    )
+    assert current_depth.grad[0, 0, 0, 0].item() < 0.0
+    assert current_depth.grad[0, 1, 1, 0].item() == 0.0
 
 
 def test_phase_snapshot_copy_restores_the_discrete_face_binding():
@@ -358,7 +712,7 @@ def test_frozen_geometry_uses_snapshot_face_binding_not_live_binding():
         def __init__(self):
             self._face_idx = torch.tensor([91, 92], dtype=torch.long)
             self.map_binding = None
-            self.jacobian_binding = None
+            self.frame_binding = None
 
         def _flame_verts_and_normals(self):
             return torch.zeros(3, 3), torch.zeros(3, 3)
@@ -367,14 +721,13 @@ def test_frozen_geometry_uses_snapshot_face_binding_not_live_binding():
             self.map_binding = face_idx.detach().clone()
             return torch.zeros(uvd.shape[0], 3)
 
-        def _uvd_jacobian(
-            self, vertices, normals, *, face_idx, uv, d
+        def _deformed_scaling_rotation(
+            self, vertices, *, face_idx, local_scaling, local_rotation
         ):
-            self.jacobian_binding = face_idx.detach().clone()
-            return torch.eye(3).repeat(uv.shape[0], 1, 1)
-
-        def _world_covariance_matrix(self, jacobian, scale, rotation):
-            return torch.eye(3).repeat(jacobian.shape[0], 1, 1)
+            self.frame_binding = face_idx.detach().clone()
+            rotation = torch.zeros(local_scaling.shape[0], 4)
+            rotation[:, 0] = 1.0
+            return local_scaling, rotation
 
         @staticmethod
         def scaling_activation(scale):
@@ -408,7 +761,81 @@ def test_frozen_geometry_uses_snapshot_face_binding_not_live_binding():
     )
 
     assert torch.equal(gaussian.map_binding, snapshot_binding)
-    assert torch.equal(gaussian.jacobian_binding, snapshot_binding)
+    assert torch.equal(gaussian.frame_binding, snapshot_binding)
+
+
+def test_frozen_geometry_uses_snapshot_scale_mask_after_live_densification():
+    class FakeGaussian:
+        device = torch.device("cpu")
+        num_gs = 3
+
+        def _flame_verts_and_normals(self):
+            return torch.zeros(3, 3), torch.zeros(3, 3)
+
+        def _map_uvd_to_xyz(self, uvd, vertices, normals, *, face_idx):
+            return torch.zeros(uvd.shape[0], 3)
+
+        def _deformed_scaling_rotation(
+            self, vertices, *, face_idx, local_scaling, local_rotation
+        ):
+            rotation = torch.zeros(local_scaling.shape[0], 4)
+            rotation[:, 0] = 1.0
+            return local_scaling, rotation
+
+        @staticmethod
+        def scaling_activation(scale):
+            return scale
+
+        @staticmethod
+        def opacity_activation(opacity):
+            return opacity
+
+    gaussian = FakeGaussian()
+    system = SimpleNamespace(
+        gaussian=gaussian,
+        alignment=torch.eye(4),
+        cfg=SimpleNamespace(
+            scale_stability={
+                "hard_max_world_scale": 0.05,
+                "max_world_anisotropy": None,
+            },
+            max_world_scale=0.05,
+        ),
+        _set_pose=lambda *args: None,
+        _batch_pose=lambda batch: (),
+        _set_reference_pose=lambda: None,
+        _full_scale_stability_enabled=lambda: True,
+        _full_region_protection_enabled=lambda: True,
+        _active_trainable_point_mask=lambda: (_ for _ in ()).throw(
+            AssertionError("live densified mask must not be used")
+        ),
+    )
+    system._full_world_scale_axis_ratio = (
+        lambda scales, trainable_mask=None: (
+            Head3DGSLKsReconstructionFinetune._full_world_scale_axis_ratio(
+                system, scales, trainable_mask
+            )
+        )
+    )
+    state = {
+        "uv": torch.zeros(2, 2),
+        "d": torch.zeros(2, 1),
+        "face_idx": torch.tensor([3, 7], dtype=torch.long),
+        "scale": torch.full((2, 3), 0.10),
+        "rotation": torch.zeros(2, 4),
+        "opacity": torch.ones(2, 1),
+        "scale_trainable_mask": torch.tensor([True, False]),
+    }
+
+    packed, _ = (
+        Head3DGSLKsReconstructionFinetune._frozen_reference_geometry(
+            system, state, {}
+        )
+    )
+    scales = packed[1]
+
+    assert torch.allclose(scales[0], torch.full((3,), 0.05))
+    assert torch.allclose(scales[1], torch.full((3,), 0.10))
 
 
 def test_snapshot_surface_masks_ignore_live_face_rebinding():

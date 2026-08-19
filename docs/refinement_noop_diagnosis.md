@@ -26,8 +26,11 @@ GradScaler 因而跳过 optimizer；Lightning 的 global step 仍继续增长，
 - full 改用与 mouth 相同的 AnimPortrait3D 四通道 ControlNet、显式 VAE 和
   `animportrait3d` ISM；全局分支不使用 ControlNet，face/eye/mouth 使用固定
   landmark crop 放大到 512×512；
-- 恢复原版 full 的 UVD/scale/rotation 学习率、50/100 步屏幕梯度 densification
-  和 70% 正面半球采样；移除会饱和并拉回旧 artifacts 的自适应 replay/proximal；
+- 保留原版 full 的 UVD/rotation 学习率和 70% 正面半球采样；scale 学习率降低
+  到十分之一，并使用 `0.05` 的逐轴 world hard cap 和相对 mouth 输入的 world
+  growth/anisotropy envelope；默认关闭 densification 以保持已验证的 mouth
+  topology，显式消融时才通过命令行开启；
+  移除会饱和并拉回旧 artifacts 的自适应 replay/proximal；
 - 连续 8 次 optimizer 未执行会立即终止；导出前也会拒绝零更新结果；
 - mouth sidecar 记录真实 optimizer step，full 会拒绝旧的 no-op 输出和短 smoke 输出。
 
